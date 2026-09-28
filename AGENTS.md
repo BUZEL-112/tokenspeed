@@ -185,12 +185,15 @@ Inside the root `tokenspeed-kernel/` directory:
   feature flags) or scalar knob specialization that matters greatly for kernel
   performance (e.g., block size, alignment). Values that vary per batch or
   request (e.g, token, request, row counts, sequence lengths, block-table
-  widths) must be runtime arguments, or be bucketed first (e.g.
-  `next_power_of_2`) when the kernel needs a compile-time bound. Reviews
-  should check every new or changed kernel signature and launch site for this.
-  Kernels should have tests to guard against excessive scalar parameter
-  specialization with `assert_no_triton_compile` from `test/utils.py`; for
-  tensor parameters no need to test.
+  widths), and values derived from them (e.g., the strides that follow those
+  widths, split counts computed from the batch size), must be runtime
+  arguments, or be bucketed first (e.g. `next_power_of_2`) when the kernel
+  needs a compile-time bound. The same holds for template arguments of other
+  JITs such as DeepGEMM. Reviews should check every new or changed kernel
+  signature and launch site for this. Kernels should have tests to guard
+  against excessive scalar parameter specialization with
+  `assert_no_triton_compile` from `test/utils.py`; for tensor parameters no
+  need to test.
 
 ## tokenspeed-kernel-amd
 
