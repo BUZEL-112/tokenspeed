@@ -239,5 +239,199 @@ def test_nvfp4_projection_setup_uses_processed_expert_scale(
         projection.prepare_nvfp4_output.assert_not_called()
 
 
+def _make_amd_moe(fork, *, routed, shared, projection, norm, mapping):
+    moe = _make_moe(fork, num_tokens=routed.shape[0])
+    moe.mapping = mapping
+    moe.execution_plan = SimpleNamespace(use_native=True)
+    moe.comm = None
+    moe.routed_hidden = routed.shape[1]
+    moe.routed_expert_norm = norm
+    moe.routed_expert_up_proj = projection
+    moe.shared_experts = mock.Mock(return_value=shared)
+    moe._routed_experts = mock.Mock(return_value=routed)
+    moe._forward_amd = KimiLinearMoE._forward_amd.__get__(moe)
+    return moe
+
+
+@pytest.mark.parametrize(
+    "rows,producer_direct,tp,ep,narrowed,solution,accepted,attempted,pp_size",
+    [
+        (1, True, 8, 1, False, "auto", True, False, 1),
+        (32, True, 8, 1, False, "auto", True, False, 1),
+        (39, True, 8, 1, False, "auto", True, False, 1),
+        (40, True, 8, 1, False, "auto", True, True, 1),
+        (41, True, 8, 1, False, "auto", False, True, 1),
+        (48, True, 8, 1, False, "auto", True, True, 1),
+        (64, True, 8, 1, False, "auto", True, True, 1),
+        (504, True, 8, 1, False, "auto", True, True, 1),
+        (512, True, 8, 1, False, "auto", True, True, 1),
+        (848, True, 8, 1, False, "auto", True, True, 1),
+        (8192, True, 8, 1, False, "auto", True, True, 1),
+        (8200, True, 8, 1, False, "auto", True, False, 1),
+        (8192, False, 8, 1, False, "auto", True, False, 1),
+        (8192, True, 1, 8, False, "auto", True, False, 1),
+        (8192, True, 8, 1, True, "auto", True, False, 1),
+        (8192, True, 8, 1, False, "torch", True, False, 1),
+        (8192, True, 8, 1, False, "auto", False, True, 1),
+        (8192, True, 8, 1, False, "auto", True, False, 2),
+    ],
+)
+@pytest.mark.parametrize("has_norm", [False, True])
+@pytest.mark.parametrize(
+    "graph_phase,capture_mode", [(False, False), (True, False), (True, True)]
+)
+def test_row_sharded_moe_tail_selection_and_fallback(
+    monkeypatch,
+    rows,
+    producer_direct,
+    tp,
+    ep,
+    narrowed,
+    solution,
+    accepted,
+    attempted,
+    pp_size,
+    has_norm,
+    graph_phase,
+    capture_mode,
+):
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    routed = torch.empty((rows, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((rows, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    expected = torch.empty_like(shared)
+    fallback = torch.empty_like(shared)
+    group = tuple(range(8))
+    process_group = object()
+    norm = (
+        mock.Mock(
+            return_value=routed,
+            weight=torch.empty(3584, dtype=torch.bfloat16, device="meta"),
+            variance_epsilon=1e-5,
+        )
+        if has_norm
+        else None
+    )
+    projection = SimpleNamespace(
+        narrowed=narrowed,
+        solution=solution,
+        weight=torch.empty((7168, 3584), dtype=torch.bfloat16, device="meta"),
+        forward_add3=mock.Mock(return_value=fallback),
+    )
+    fork = _SpyFork()
+    moe = _make_amd_moe(
+        fork,
+        routed=routed,
+        shared=shared,
+        projection=projection,
+        norm=norm,
+        mapping=SimpleNamespace(
+            pp_size=pp_size,
+            attn=SimpleNamespace(dp_size=1, tp_size=8, tp_group=group),
+            moe=SimpleNamespace(tp_size=tp, ep_size=ep, tp_ep_group=group),
+        ),
+    )
+
+    def run_tail(*args, **kwargs):
+        assert not fork.inside_scope and fork.events[-1] == "join"
+        return expected if accepted else None
+
+    def reduce_partials(partials, actual_group):
+        assert not fork.inside_scope and actual_group == group
+        return partials
+
+    candidate = mock.Mock(side_effect=run_tail)
+    joined = mock.Mock(side_effect=reduce_partials)
+    resolve = mock.Mock(return_value=process_group)
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed_kernel.ops.communication.iris",
+        SimpleNamespace(iris_kimi3_moe_tail=candidate),
+    )
+    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
+    monkeypatch.setattr(mod, "all_reduce", joined)
+    monkeypatch.setattr(mod, "_get_process_group", resolve)
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: graph_phase)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: capture_mode)
+    monkeypatch.setattr(
+        mod, "can_acquire_all_reduce_outputs", lambda *args: producer_direct
+    )
+    acquire = mock.Mock(return_value=(routed, shared))
+    monkeypatch.setattr(mod, "acquire_all_reduce_outputs", acquire)
+    monkeypatch.setattr(mod, "_amd_moe_join_lane", lambda *args: None)
+
+    output = KimiLinearMoE.forward(moe, prefix, prefix, rows, rows)
+
+    assert fork.calls == [{"enable": graph_phase, "overlap": capture_mode}]
+    assert moe.experts._situ_output_buffer is (routed if producer_direct else None)
+    moe.shared_experts.assert_called_once_with(
+        prefix, down_out=shared if producer_direct else None
+    )
+    assert moe._routed_experts.call_args.kwargs["do_finalize"] is True
+    if attempted:
+        candidate.assert_called_once_with(
+            routed,
+            shared,
+            prefix,
+            projection.weight,
+            norm_weight=norm.weight if has_norm else None,
+            eps=norm.variance_epsilon if has_norm else None,
+            group=process_group,
+        )
+        resolve.assert_called_once_with(group)
+    else:
+        candidate.assert_not_called()
+        resolve.assert_not_called()
+    if attempted and accepted:
+        assert output is expected
+        joined.assert_not_called()
+        projection.forward_add3.assert_not_called()
+        if has_norm:
+            norm.assert_not_called()
+    else:
+        assert output._base is fallback and output.shape == shared.shape
+        joined.assert_called_once_with((routed, shared), group)
+        projection.forward_add3.assert_called_once_with(routed, prefix, shared)
+        if has_norm:
+            norm.assert_called_once_with(routed)
+
+
+def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    group = tuple(range(8))
+    routed = torch.empty((512, 3584), dtype=torch.bfloat16, device="meta")
+    shared = torch.empty((512, 7168), dtype=torch.bfloat16, device="meta")
+    prefix = torch.empty_like(shared)
+    fallback = torch.empty_like(shared)
+    moe = _make_amd_moe(
+        _SpyFork(),
+        routed=routed,
+        shared=shared,
+        projection=SimpleNamespace(forward_add3=mock.Mock(return_value=fallback)),
+        norm=None,
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(dp_size=1), moe=SimpleNamespace(tp_ep_group=group)
+        ),
+    )
+    monkeypatch.setattr(
+        mod, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
+    )
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed_kernel.ops.communication.iris", SimpleNamespace()
+    )
+    monkeypatch.setattr(mod, "can_acquire_all_reduce_outputs", lambda *args: True)
+    monkeypatch.setattr(
+        mod, "acquire_all_reduce_outputs", lambda *args: (routed, shared)
+    )
+    monkeypatch.setattr(mod, "all_reduce", mock.Mock(return_value=(routed, shared)))
+    monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: False)
+    monkeypatch.setattr(mod, "get_is_capture_mode", lambda: False)
+
+    result = KimiLinearMoE.forward(moe, prefix, prefix, 512, 512)
+    assert result._base is fallback
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -48,11 +48,19 @@ from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
 
 
 @needs_iris
-def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
+@pytest.mark.parametrize("pp_size", [1, 2])
+@pytest.mark.parametrize(
+    "max_rows,tail_rows",
+    [(39, 0), (40, 40), (47, 40), (511, 504), (8192, 8192), (16384, 8192)],
+)
+def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
+    monkeypatch, pp_size, max_rows, tail_rows
+):
     from tokenspeed.runtime.models import kimi_k3
 
     group = tuple(range(8))
     mapping = SimpleNamespace(
+        pp_size=pp_size,
         attn=SimpleNamespace(tp_size=8, tp_group=group),
         moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=group),
     )
@@ -68,15 +76,16 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(monkeypatch):
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
-        max_num_tokens=16384,
+        max_num_tokens=max_rows,
     )
     prepare.assert_called_once_with(
         group,
-        staged_max_numel=8192 * 7168,
-        producer_direct_max_numel=8192 * (7168 + 3584),
+        staged_max_numel=min(max_rows, 8192) * 7168,
+        producer_direct_max_numel=min(max_rows, 8192) * (7168 + 3584),
         attnres_max_numel=16 * 7168,
         attnres_max_rows=16,
         enable_lamport=True,
+        moe_tail_max_rows=tail_rows if pp_size == 1 else 0,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -89,6 +98,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
     attn_group = (0, 1, 2, 3)
     moe_group = tuple(range(8))
     mapping = SimpleNamespace(
+        pp_size=1,
         attn=SimpleNamespace(tp_size=4, tp_group=attn_group),
         moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=moe_group),
     )
@@ -114,6 +124,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
+            moe_tail_max_rows=0,
             dtype=torch.bfloat16,
             backend=None,
         ),
@@ -124,6 +135,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             attnres_max_numel=0,
             attnres_max_rows=0,
             enable_lamport=False,
+            moe_tail_max_rows=0,
             dtype=torch.bfloat16,
             backend=None,
         ),
@@ -137,6 +149,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
     attn_group = (0,)
     moe_group = tuple(range(8))
     mapping = SimpleNamespace(
+        pp_size=1,
         attn=SimpleNamespace(tp_size=1, tp_group=attn_group),
         moe=SimpleNamespace(tp_ep_size=8, tp_ep_group=moe_group),
     )
@@ -161,6 +174,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=False,
+        moe_tail_max_rows=0,
         dtype=torch.bfloat16,
         backend=None,
     )
@@ -172,6 +186,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
 
     group = tuple(range(4))
     mapping = SimpleNamespace(
+        pp_size=1,
         attn=SimpleNamespace(tp_size=4, tp_group=group),
         moe=SimpleNamespace(tp_ep_size=4, tp_ep_group=group),
     )
@@ -196,6 +211,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         attnres_max_numel=0,
         attnres_max_rows=0,
         enable_lamport=False,
+        moe_tail_max_rows=0,
         dtype=torch.bfloat16,
         backend=None,
     )

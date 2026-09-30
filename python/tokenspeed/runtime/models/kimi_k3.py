@@ -116,6 +116,7 @@ from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
+    _get_process_group,
 )
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -1445,6 +1446,7 @@ def _attnres_scratch(
 
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
+_IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
 
 
 def prepare_k3_all_reduce_buffers(
@@ -1472,12 +1474,13 @@ def prepare_k3_all_reduce_buffers(
     )
     groups_are_equal = mapping.attn.tp_group == mapping.moe.tp_ep_group
     # The Lamport crossover was measured with attention TP8 and MoE TP8.
-    enable_lamport = (
+    tp8_moe = (
         groups_are_equal
         and mapping.attn.tp_size == 8
         and mapping.moe.tp_size == 8
         and mapping.moe.ep_size == 1
     )
+    enable_lamport = tp8_moe
     # Keep the full producer-direct window for equal TP8 groups. Its 50K/500
     # C16 gain survives content-sensitive EAGLE3 trajectories; retain 48 tokens
     # for other mappings.
@@ -1488,6 +1491,16 @@ def prepare_k3_all_reduce_buffers(
         max_num_tokens
         if expand_moe_window
         else min(max_num_tokens, _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS)
+    )
+    # The tail currently implements the measured TP8 Kimi-K3 dimensions.
+    # Other widths retain the ordinary reduction and projection contract.
+    moe_tail_max_rows = (
+        max_num_tokens // 8 * 8
+        if tp8_moe
+        and mapping.pp_size == 1
+        and (hidden_size, routed_hidden_size) == (7168, 3584)
+        and max_num_tokens >= _IRIS_MOE_ROW_SHARD_MIN_TOKENS
+        else 0
     )
     prepared = False
     if mapping.attn.tp_size > 1:
@@ -1502,6 +1515,7 @@ def prepare_k3_all_reduce_buffers(
             attnres_max_numel=attnres_max_rows * hidden_size,
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
+            moe_tail_max_rows=moe_tail_max_rows,
             dtype=torch.bfloat16,
             backend=None,
         )
@@ -1515,6 +1529,7 @@ def prepare_k3_all_reduce_buffers(
                 attnres_max_numel=0,
                 attnres_max_rows=0,
                 enable_lamport=False,
+                moe_tail_max_rows=0,
                 dtype=torch.bfloat16,
                 backend=None,
             )
@@ -2103,9 +2118,9 @@ class KimiLinearMoE(nn.Module):
         """Run native EP, or join TP partials before norm and replicated up-projection.
 
         TP producers use symmetric outputs or a packed lane when available.
-        After joining streams, reduce the pair in place, concatenate small
-        partials, or group large partials; forward_add3 combines the up-projection
-        with the shared output and attention residual.
+        After joining streams, the TP8 Iris tail normalizes and projects local
+        rows, then gathers the combined output. Other shapes reduce both partials
+        before forward_add3 combines the projection, shared output and residual.
         """
         if self.native_latent_moe is not None:
             if self._use_fused_decode_pipeline and 0 < hidden_states.shape[0] <= 4:
@@ -2170,6 +2185,36 @@ class KimiLinearMoE(nn.Module):
                 max_num_tokens_per_gpu,
                 do_finalize=True,
             )
+        # Both producers have joined before the tail reads their symmetric outputs.
+        # Its final gather completes before the next producer can reuse the input.
+        up_proj = self.routed_expert_up_proj
+        if (
+            outputs is not None
+            and lane is None
+            and current_platform().is_cdna4
+            and self.mapping.pp_size == 1
+            and _IRIS_MOE_ROW_SHARD_MIN_TOKENS <= num_tokens <= _IRIS_MAX_TOKENS
+            and self.mapping.attn.tp_size == 8
+            and self.mapping.moe.tp_size == 8
+            and self.mapping.moe.ep_size == 1
+            and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
+            and not up_proj.narrowed
+            and up_proj.solution == "auto"
+        ):
+            from tokenspeed_kernel.ops.communication.iris import iris_kimi3_moe_tail
+
+            norm = self.routed_expert_norm
+            output = iris_kimi3_moe_tail(
+                routed,
+                shared_partial,
+                prefix_sum,
+                up_proj.weight,
+                norm_weight=norm.weight if norm is not None else None,
+                eps=norm.variance_epsilon if norm is not None else None,
+                group=_get_process_group(group),
+            )
+            if output is not None:
+                return output
         # A producer may return its own tensor instead of filling its destination.
         if outputs is not None and all(
             partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
