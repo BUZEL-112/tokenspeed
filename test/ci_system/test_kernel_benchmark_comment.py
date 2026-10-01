@@ -587,7 +587,7 @@ def test_comment_workflow_has_a_minimal_trusted_contract():
 
     assert triggers == {
         "workflow_run": {
-            "workflows": ["PR Test AMD"],
+            "workflows": ["AMD Tests"],
             "types": ["completed"],
         }
     }
