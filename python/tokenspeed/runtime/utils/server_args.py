@@ -66,8 +66,6 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 logger = get_colorful_logger(__name__)
 
-ENABLE_CP = os.environ.get("ENABLE_CP", "false").lower() in ("true", "1")
-
 # Sampling backends whose verify runs the draft-prob chain kernel
 # (--enable-speculative-sampling). greedy verifies by exact match and the
 # Triton backends by target-sampled exact match; the drafter's recorded
@@ -175,6 +173,100 @@ def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
     """
     if value not in choices:
         raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
+
+
+# Attention backends whose sparse prefill can attend a query shard against the
+# gathered history of its requests (the query-context-parallel extend arm).
+QCP_ATTENTION_BACKENDS = frozenset({"dsa"})
+
+
+def validate_qcp(
+    *,
+    qcp_size: int,
+    attn_tp_size: int,
+    attn_dp_size: int,
+    dense_tp_size: int,
+    moe_tp_ep_size: int,
+    dcp_size: int,
+    disaggregation_mode: str,
+    disable_prefill_graph: bool,
+    enable_mixed_batch: bool,
+    attention_backend: str | None,
+    kv_cache_dtype: str,
+    kv_cache_quant_method: str,
+) -> None:
+    """Reject query-context-parallel layouts the first landing does not serve.
+
+    QCP shards an extend forward's rows over the attention TP group. It is a
+    prefill-role layout: the decode arm serves only the drafter's steps, the
+    eager extend break gathers the request history, and the sparse DSA
+    kernels attend the gathered buffer. ``qcp_size == 1`` is off and passes.
+    """
+    if qcp_size == 1:
+        return
+    if kv_cache_dtype not in ("auto", "bfloat16") or kv_cache_quant_method != "none":
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires a bf16 KV cache (got "
+            f"--kv-cache-dtype {kv_cache_dtype!r}, --kv-cache-quant-method "
+            f"{kv_cache_quant_method!r}): the sharded KV write gathers the rotated "
+            "latent and stores it with latent_store, which writes native rows only"
+        )
+    if qcp_size != attn_tp_size:
+        raise ValueError(
+            "--prefill-context-parallel-size must equal the attention TP size "
+            f"(got {qcp_size} with attn_tp_size={attn_tp_size}): the query shard "
+            "spans the whole attention TP group"
+        )
+    if attn_dp_size != 1:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires attention DP 1 (got "
+            f"attn_dp_size={attn_dp_size}): the sampled-row table of a shard is "
+            "per DP group and the DP metadata gather does not carry it"
+        )
+    if dense_tp_size not in (1, attn_tp_size) or moe_tp_ep_size not in (
+        1,
+        attn_tp_size,
+    ):
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --dense-tp-size and the "
+            f"MoE TP x EP group to be 1 or the attention TP width {attn_tp_size} "
+            f"(got dense {dense_tp_size}, MoE {moe_tp_ep_size}): the attention "
+            "weights are head-replicated, so the drafter's replicated decode rows "
+            "are never scattered and a narrower dense or MoE group has no rows to "
+            "gather"
+        )
+    if disaggregation_mode != "prefill":
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --disaggregation-mode "
+            f"prefill (got {disaggregation_mode!r}): a sharded extend and "
+            "replicated decode rows cannot share one forward"
+        )
+    if not disable_prefill_graph:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires --disable-prefill-graph: "
+            "the history gather runs in the eager attention break"
+        )
+    if enable_mixed_batch:
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 does not support "
+            "--enable-mixed-batch: a MIXED round would carry sharded extend rows "
+            "and replicated decode rows in one forward"
+        )
+    if (
+        attention_backend is not None
+        and attention_backend not in QCP_ATTENTION_BACKENDS
+    ):
+        raise ValueError(
+            "--prefill-context-parallel-size > 1 requires a DSA-family attention "
+            f"backend ({sorted(QCP_ATTENTION_BACKENDS)}), got "
+            f"--attention-backend {attention_backend!r}"
+        )
+    if dcp_size not in (1, qcp_size):
+        raise ValueError(
+            "--decode-context-parallel-size must be 1 or equal to "
+            f"--prefill-context-parallel-size (got dcp={dcp_size}, qcp={qcp_size}): "
+            "the history gather splits by the page owners of the whole shard group"
+        )
 
 
 @dataclasses.dataclass
@@ -363,6 +455,9 @@ class ServerArgs:
 
     # DeepSeek V4
     decode_context_parallel_size: int = 1
+    # Query context parallelism on the PD prefill role: shard every extend
+    # forward's rows over the attention TP group (1 = off).
+    prefill_context_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -767,23 +862,16 @@ class ServerArgs:
         attn_tp_size = self.attn_tp_size
         attn_dp_size = self.data_parallel_size
 
-        # ``ENABLE_CP`` interprets attention TP size as CP size.
-        attn_cp_size = 1
-        if ENABLE_CP:
-            attn_cp_size, attn_tp_size = attn_tp_size, 1
-
         if world_size is None:
             world_size = pp_size
             if attn_tp_size is not None:
                 world_size *= attn_tp_size
-            if attn_cp_size is not None:
-                world_size *= attn_cp_size
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
                 f"Inferred world_size ({world_size!s}) from attn_tp_size ("
-                f"{attn_tp_size!s}) x attn_cp_size ({attn_cp_size!s}) x attn_dp_size ("
-                f"{attn_dp_size!s}) x pp_size ({pp_size!s})",
+                f"{attn_tp_size!s}) x attn_dp_size ({attn_dp_size!s}) x pp_size "
+                f"({pp_size!s})",
             )
         else:
             logger.info(f"Specified world_size ({world_size!s})")
@@ -797,19 +885,19 @@ class ServerArgs:
             )
         stage_world_size = world_size // pp_size
 
-        attn_tp_size, attn_cp_size, attn_dp_size = _resolve_parallelism_sizes(
-            stage_world_size, attn_tp_size, attn_cp_size, attn_dp_size
+        attn_tp_size, attn_dp_size = _resolve_parallelism_sizes(
+            stage_world_size, attn_tp_size, attn_dp_size
         )
 
         # Dense layers default to the attention replica's TP width
-        # (attn_tp_size x attn_cp_size == world_size // attn_dp_size). Without
-        # DP attention this is the full world, unchanged from before; with DP
-        # attention it keeps each dense all-reduce inside one replica (matching
-        # attn) instead of spanning the whole world, which would otherwise cross
+        # (attn_tp_size == world_size // attn_dp_size). Without DP attention
+        # this is the full world, unchanged from before; with DP attention it
+        # keeps each dense all-reduce inside one replica (matching attn)
+        # instead of spanning the whole world, which would otherwise cross
         # nodes and force attn_tp != dense_tp. Pass --dense-tp-size to override.
         dense_tp_size = self.dense_tp_size
         if self.dense_tp_size is None:
-            dense_tp_size = attn_tp_size * attn_cp_size
+            dense_tp_size = attn_tp_size
         dense_dp_size = None
 
         # --enable-expert-parallel auto-sets ep_size = the stage world (the
@@ -849,11 +937,11 @@ class ServerArgs:
         self.mapping = Mapping(
             world_size=world_size,
             attn_tp_size=attn_tp_size,
-            attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
             attn_dcp_size=self.decode_context_parallel_size,
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
+            attn_qcp_size=self.prefill_context_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -874,6 +962,20 @@ class ServerArgs:
             has_dcp=self.mapping.attn.has_dcp,
             disaggregation_mode=self.disaggregation_mode,
         )
+        validate_qcp(
+            qcp_size=self.mapping.attn.qcp_size,
+            attn_tp_size=self.mapping.attn.tp_size,
+            attn_dp_size=self.mapping.attn.dp_size,
+            dense_tp_size=self.mapping.dense.tp_size,
+            moe_tp_ep_size=self.mapping.moe.tp_ep_size,
+            dcp_size=self.mapping.attn.dcp_size,
+            disaggregation_mode=self.disaggregation_mode,
+            disable_prefill_graph=bool(self.disable_prefill_graph),
+            enable_mixed_batch=self.enable_mixed_batch,
+            attention_backend=self.attention_backend,
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_quant_method=self.kv_cache_quant_method,
+        )
         if self.mapping.moe.has_tp and self.mapping.moe.has_ep:
             raise ValueError("MoE TP and EP cannot be both > 1")
         self._validate_decode_tp_layouts()
@@ -886,18 +988,13 @@ class ServerArgs:
                 )
             if self.mapping.nnodes != 1:
                 logger.warning("--mm-encoder-tp-mode data on nnodes>1 is experimental")
-            if self.mapping.has_attn_cp:
-                raise ValueError(
-                    "--mm-encoder-tp-mode data does not currently support "
-                    "attention context parallelism"
-                )
 
         logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
     def _validate_decode_tp_layouts(self):
         """Constraints of the decode-side TP layouts under attention DP.
 
-        The structural rules (head TP needs attention TP 1 and CP 1, tiles the
+        The structural rules (head TP needs attention TP 1 and tiles the
         stage world; LM head TP under DP needs attention TP 1) live in
         ``Mapping``. This checks what only the server knows: the engine role
         and the batch-invariance selection. The weights' quantization is
@@ -1367,20 +1464,18 @@ class ServerArgs:
                         "is not supported with --pipeline-parallel-size > 1; "
                         f"pipeline speculation supports {PIPELINE_SPEC_ALGORITHMS}"
                     )
-                # Current CachePD / draft layout limits rather than PP limits:
-                # CachePD has no CP partition contract, and the DSPARK draft
-                # reduces its attention-TP embedding partials over the dense
-                # TP group. MTP drafts embed with an ordinary reduced
+                # A draft layout limit rather than a PP limit: the DSPARK
+                # draft reduces its attention-TP embedding partials over the
+                # dense TP group. MTP drafts embed with an ordinary reduced
                 # vocab-parallel lookup, so only DSPARK carries the rule.
                 # Both TP groups are stride-1 over the stage, so equal widths
                 # mean equal groups (the mapping has no rank yet here).
-                if self.speculative_algorithm == "DSPARK" and (
-                    self.mapping.attn.cp_size != 1
-                    or self.mapping.dense.tp_size != self.mapping.attn.tp_size
+                if (
+                    self.speculative_algorithm == "DSPARK"
+                    and self.mapping.dense.tp_size != self.mapping.attn.tp_size
                 ):
                     raise ValueError(
-                        "Pipeline DSPARK requires attention CP=1 and matching "
-                        "dense/attention TP groups"
+                        "Pipeline DSPARK requires matching dense/attention TP groups"
                     )
             if (
                 self.pp_layer_partition is not None
@@ -1536,13 +1631,9 @@ class ServerArgs:
                     "Gluon Petit MegaMoE requires --dtype bfloat16; "
                     f"configured dtype={self.dtype}"
                 )
-            if (
-                self.mapping.attn.tp_size != 1
-                or self.mapping.attn.cp_size != 1
-                or self.mapping.dense.tp_size != 1
-            ):
+            if self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1:
                 raise ValueError(
-                    "Gluon Petit MegaMoE requires attention TP1, CP1, and dense TP1"
+                    "Gluon Petit MegaMoE requires attention TP1 and dense TP1"
                 )
             decode_tokens_per_request = (
                 self.speculative_num_draft_tokens
@@ -1696,9 +1787,6 @@ class ServerArgs:
             raise ValueError(
                 f"max_num_seqs must be >= attn_dp_size: {self.max_num_seqs=} < {self.mapping.attn.dp_size=}"
             )
-
-        if self.mapping.has_attn_cp and self.max_num_seqs > 1:
-            raise ValueError("CP attention is enabled but max_num_seqs > 1")
 
         self.validate_model_update_options()
 
@@ -2961,12 +3049,23 @@ class ServerArgs:
             "o_proj / down_proj weights.",
         )
         parser.add_argument(
+            "--prefill-context-parallel-size",
+            type=int,
+            default=ServerArgs.prefill_context_parallel_size,
+            help="Shard every extend forward's query rows over the attention TP "
+            "group on the PD prefill role (query context parallelism): rank r "
+            "computes a contiguous slice of the chunk's rows against the gathered "
+            "KV history of its requests. Must equal --attn-tp-size and requires "
+            "--disaggregation-mode prefill, --disable-prefill-graph, a DSA-family "
+            "attention backend and --decode-context-parallel-size 1 or equal.",
+        )
+        parser.add_argument(
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
             help="Specify tp size for dense part. Defaults to the attention "
-            "replica width (attn_tp_size x attn_cp_size): the full world without "
-            "DP attention, one replica with it.",
+            "TP width: the full world without DP attention, one replica with "
+            "it.",
         )
         parser.add_argument(
             "--moe-tp-size",

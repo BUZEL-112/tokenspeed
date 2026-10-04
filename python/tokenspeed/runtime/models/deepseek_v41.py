@@ -1072,6 +1072,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             dense_batch_invariant=False,
             input_layernorm=None,
             post_attn_layernorm=None,
+            query_sharded=False,
         )
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1286,8 +1287,8 @@ class DeepseekV41Model(nn.Module):
         host_layout: str,
     ):
         super().__init__()
-        if mapping.pp_size != 1 or mapping.attn.cp_size != 1:
-            raise NotImplementedError("V4.1 full-prompt baseline requires PP=CP=1")
+        if mapping.pp_size != 1:
+            raise NotImplementedError("V4.1 full-prompt baseline requires PP=1")
         if mapping.attn.tp_size != mapping.moe.tp_ep_size:
             raise NotImplementedError(
                 "V4.1 HC residuals require attention TP == MoE TPxEP"

@@ -56,13 +56,7 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.utils import (
-    CP_METADATA,
-    ENABLE_CP,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    get_layer_id,
-)
+from tokenspeed.runtime.layers.utils import get_layer_id
 
 _platform = current_platform()
 _is_blackwell = _platform.is_blackwell
@@ -111,7 +105,10 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    QueryShardGather,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
@@ -171,6 +168,18 @@ def _prepare_mla_kv_b_proj_weights(
         bind_or_copy(self_attn.w_kc, w_kc),
         bind_or_copy(self_attn.w_vc, w_vc),
     )
+
+
+def _reject_query_shard(ctx: ForwardContext, where: str) -> None:
+    """Fail loud when a sharded forward reaches an MLA path that attends every
+    row of the span (the dense, expanded prologue with head-sharded weights);
+    only the absorbed sparse path can take a query shard."""
+    if ctx.query_shard is not None and ctx.query_shard.size > 1:
+        raise RuntimeError(
+            f"{where} cannot take a query shard: query context parallelism "
+            "runs the absorbed sparse DSA prefill, whose prologue gathers the "
+            "rotated latent across the group"
+        )
 
 
 class DeepseekV3MLP(nn.Module):
@@ -820,12 +829,18 @@ class DeepseekV3AttentionMLA(nn.Module):
         whole-attention break leaves. Outside capture the ``@break_point`` is
         a direct call, so the eager path is unchanged.
 
+        This dense MLA path (expanded prefill prologue, head-sharded weights)
+        attends every row of the span, so it refuses a query shard outright
+        -- before the empty-row return, since a rank whose shard is empty
+        would otherwise skip collectives the other ranks join.
+
         Every decoder layer calls this on an idle forward too, with its empty
         input rows. Without head TP that is a no-op; under head TP the rank
         still owns a head shard of its group's tokens, so it computes that
         shard here and joins every exchange (they are collectives) -- the one
         place idle participation lives, so no layer branches on the layout.
         """
+        _reject_query_shard(ctx, "DeepseekV3AttentionMLA.forward")
         if hidden_states.shape[0] == 0 and not self.has_head_tp:
             # The o_proj output shape (the Eagle3 input is twice as wide).
             return hidden_states.new_empty(0, self.hidden_size)
@@ -1215,17 +1230,20 @@ class DeepseekV3AttentionMLA(nn.Module):
             Q = absorbed_query
             q_pe = Q[..., self.kv_lora_rank :]
         # The absorption projection must be per-row batch-invariant under
-        # rl-bitwise: the cuBLAS batched GEMM retiles by the token count.
-        bmm(
-            q_nope.transpose(0, 1),
-            self.w_kc.transpose(1, 2),
-            out=Q[..., : self.kv_lora_rank].transpose(0, 1),
-            override=(
-                "aok"
-                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
-                else None
-            ),
-        )
+        # rl-bitwise: the cuBLAS batched GEMM retiles by the token count. A
+        # rank whose query shard is empty has nothing to absorb but still
+        # runs the prologue for its collectives.
+        if q_nope.shape[0] > 0:
+            bmm(
+                q_nope.transpose(0, 1),
+                self.w_kc.transpose(1, 2),
+                out=Q[..., : self.kv_lora_rank].transpose(0, 1),
+                override=(
+                    "aok"
+                    if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                    else None
+                ),
+            )
         return Q, q_pe
 
     def head_tp_scatter_query(
@@ -1260,10 +1278,14 @@ class DeepseekV3AttentionMLA(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
         slots: torch.Tensor,
+        *,
+        key_rows: QueryShardGather | None,
     ) -> torch.Tensor:
         """The absorbed MLA prologue: rotate the query and the latent key
         part, write the latent rows to ``slots`` and return the attention
-        query. One row count across the query, latent and positions."""
+        query. One row count across the query, latent and positions; under a
+        query shard ``key_rows`` gathers the rotated latent to the whole span
+        before the owner-masked store."""
         return self.attn_mqa.latent_prologue(
             Q,
             q_pe,
@@ -1272,6 +1294,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             ctx,
             slots=slots,
             expanded=None,
+            key_rows=key_rows,
         ).query
 
     def forward_absorb_qkv_proj(
@@ -1289,7 +1312,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         Under head TP ``q`` carries the head group's gathered rows and the
         exchange to this rank's own rows happens between the absorption and
         the prologue, so the prologue sees one row count; a rank with no rows
-        of its own skips the prologue and returns an empty query.
+        of its own skips the prologue and returns an empty query. Under a
+        query shard (head TP and query sharding exclude each other in the
+        mapping) the rows are this rank's shard and the prologue gathers the
+        rotated latent to the whole span; an empty shard still runs it.
         """
         Q, q_pe = self.absorb_query(q, absorbed_query)
         if self.has_head_tp:
@@ -1302,9 +1328,23 @@ class DeepseekV3AttentionMLA(nn.Module):
                 return Q
         # GLM's sparse prefill runs more rows than it commits: write the leading rows.
         query_tokens = Q.shape[0]
-        if cache_num_tokens is None:
+        key_rows = None
+        if ctx.query_shard is not None:
+            # A query shard rotates its own rows; the prologue gathers the
+            # rotated latent to the whole span (out_cache_loc) before the
+            # owner-masked store.
+            if cache_num_tokens is not None:
+                raise RuntimeError(
+                    "a query shard writes every row of the span; a partial write "
+                    "count cannot be combined with it"
+                )
+            key_rows = QueryShardGather(ctx.query_shard, self.mapping.attn.qcp_group)
+            cache_num_tokens = ctx.query_shard.total_rows
+        elif cache_num_tokens is None:
             cache_num_tokens = query_tokens
-        if cache_num_tokens < 0 or cache_num_tokens > query_tokens:
+        if cache_num_tokens < 0 or (
+            key_rows is None and cache_num_tokens > query_tokens
+        ):
             raise RuntimeError(
                 "MLA cache write count is outside the query capacity: "
                 f"writes={cache_num_tokens}, queries={query_tokens}"
@@ -1316,6 +1356,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             positions,
             ctx,
             slots=out_cache_loc[:cache_num_tokens],
+            key_rows=key_rows,
         )
 
     def forward_absorb_attn_v_proj(
@@ -1389,7 +1430,11 @@ class DeepseekV3AttentionMLA(nn.Module):
     ) -> MLAPrologueOutput:
         """The expanded prefill prologue over every row of ``q``: per-head keys
         and values up-projected from the latent, the rotated query, and the
-        latent rows stored at ``slots``; the inputs are left as given."""
+        latent rows stored at ``slots``; the inputs are left as given. The
+        expanded form cannot gather per-head keys across a query shard and
+        ``slots`` would be the shard's rows at the span's head, so a sharded
+        forward is refused here rather than writing the wrong rows."""
+        _reject_query_shard(ctx, "the expanded MLA prefill prologue")
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         # kv_b_proj's fp8 online-quant GEMM needs a contiguous latent, not this strided slice.
         kv = self.kv_b_proj(latent_cache[..., : self.kv_lora_rank].contiguous())[0]
@@ -1403,6 +1448,7 @@ class DeepseekV3AttentionMLA(nn.Module):
             ctx,
             slots=slots,
             expanded=MLAExpandedKV(k_nope=k_nope, value=v),
+            key_rows=None,
         )
 
     def forward_normal_chunked_kv_core(
@@ -1677,6 +1723,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             dense_batch_invariant=dense_batch_invariant and not self.is_moe_layer,
+            query_sharded=False,
         )
 
     @staticmethod
@@ -1831,15 +1878,6 @@ class DeepseekV3Model(nn.Module):
             hidden_states = input_embeds
         else:
             hidden_states = self.embed_tokens(input_ids)
-        if CP_METADATA:
-            hidden_states = cp_split_and_rebuild_data(
-                hidden_states,
-                CP_METADATA.value.split_list,
-                CP_METADATA.value.zigzag_index,
-            )
-            positions = cp_split_and_rebuild_data(
-                positions, CP_METADATA.value.split_list, CP_METADATA.value.zigzag_index
-            )
         residual = None
         aux_hidden_states = [] if self.layers_to_capture else None
         for i in range(len(self.layers)):
@@ -1865,18 +1903,8 @@ class DeepseekV3Model(nn.Module):
                 residual,
             )
         if not ctx.forward_mode.is_idle():
-            if not ENABLE_CP:
-                hidden_states, _ = layer.comm_manager.final_norm(
-                    hidden_states, residual, ctx, self.norm
-                )
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-        if CP_METADATA:
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                CP_METADATA.value,
-                self.mapping.attn.tp_rank,
-                self.mapping.attn.tp_group,
+            hidden_states, _ = layer.comm_manager.final_norm(
+                hidden_states, residual, ctx, self.norm
             )
         return hidden_states, aux_hidden_states
 
@@ -2291,6 +2319,7 @@ class Eagle3MlaDecoderLayer(nn.Module):
             prev_is_moe=False,
             dense_batch_invariant=dense_batch_invariant,
             post_attn_layernorm=self.post_attention_layernorm,
+            query_sharded=False,
         )
 
     def forward(

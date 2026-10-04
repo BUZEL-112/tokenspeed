@@ -45,7 +45,10 @@ runner-facing (`backends/base.py`: router, V4, V4.1, Mamba/KDA, composites)
 and leaf (`backends/paged/base.py`) alike: `extend_seq_lens`,
 `extend_seq_lens_cpu`, `extend_prefix_lens`, `extend_prefix_lens_cpu` are
 plain `torch.Tensor` (`[>= num_extends]` entries; empty, never `None`, when
-there are no extend requests) and `extend_with_prefix` is a plain `bool`.
+there are no extend requests) and `extend_with_prefix` is a plain `bool`, and `query_shard` is the forward's
+`QueryShardPlan` (plain host integers: which rows of the span this rank
+computes under query context parallelism) or `None` when every rank computes
+every row.
 Runner-facing nodes additionally take two host-only facts the scheduler
 knows and only V4.1 plans from: `extend_replay_lens_cpu` (how many leading
 rows of each extend re-feed already-cached positions — bounded replay,
@@ -54,7 +57,12 @@ length, so the backend can tell a prompt-completing chunk from an open one).
 Leaves never see them: the attention prologue writes every input row
 unconditionally, so the router and every other runner-facing node call
 `reject_bounded_replay` and fail loud on a non-zero replay instead of
-rewriting rows the prefix hit already shares. No default values: the runner
+rewriting rows the prefix hit already shares. Likewise every node without a
+gathered-history extend arm calls `reject_query_shard`; the router forwards
+the shard to its leaves together with `page_table_cpu`, the host mirror of
+the extend rows of each leaf's kernel page table (built only for a sharded
+forward, `None` otherwise), and the one leaf that attends a shard — GPU DSA —
+counts page ownership from it on the host. No default values: the runner
 passes the `[:num_extends]` slices of its input buffers on every call (the
 idle replay passes the empty `[:0]` slices), so a node that reads a field
 can never see a silently-defaulted one. This is deliberate — a `= False`
@@ -842,7 +850,7 @@ vocabulary is fixed, with exactly one conversion point:
 | **`CacheGroupRouter`** | attention group geometry (`CacheGroupGeometry`), each leaf's `kernel_page_size`, expansion, padding and KV write-location slot math | kernel calls |
 | `QSAIndexerBackend` | its raw compressed/recent group tables, query lengths, full-KV address view and private verify workspace | MHA leaf metadata, persistent cache allocation |
 | `Qwen4ExpPLEBackend` | its PLE checkpoint table, input/output checkpoints and verify workspace | Mamba metadata and verify context, persistent cache allocation |
-| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc` | groups, block tables, contracts, draft/target table provenance |
+| paged leaf (`PagedAttentionBackend`) | `page_table` (kernel pages, batch-ordered, padded), `seq_lens`, `out_cache_loc`; under a query shard also `page_table_cpu`, the host mirror of its extend rows, for ownership counts | groups, block tables, contracts, draft/target table provenance |
 | state consumers (Mamba/KDA, Inkling conv, V4) | their own family's raw `block_tables[gid]` (block vocabulary) | other groups' tables, runner padding |
 
 The runner (`ForwardStepRunner`) does one thing with tables: hand the
@@ -1330,6 +1338,114 @@ they are not a mutable process-global plan shared across replay streams.
 Changes to this capacity contract require validation of full-model overlap,
 memory use and performance in addition to kernel correctness.
 
+## Query context parallelism
+
+`--prefill-context-parallel-size N` (`mapping.attn.qcp_*`, `N ==
+attn.tp_size`) shards every extend forward of a PD prefill engine over the
+attention TP group. One forward, one path: the scheduler plans the whole
+chunk on every rank, the executor builds a `QueryShardPlan` from the request
+lengths (`execution/query_shard.py`: `row_counts = scatter_count(total, N)`
+— the reduce-scatter / all-gather split, so the `CommManager` row tables
+already describe the shard and the final gather needs no permutation; rank
+order is request order) and puts it on `ForwardContext.query_shard`. The
+model's rows are then `input_ids_buf[start:end]`, `positions_buf[start:end]`
+and the same slice of every per-row input; per-request inputs keep the whole
+batch with `RequestTokenHistoryView.row_offset = start`; a pipeline stage's
+boundary bundle carries shard rows. `ctx.input_num_tokens` and
+`global_num_tokens` keep the scheduler's full-chunk meaning: only collective
+sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
+its rows from its tensors or `ctx.query_shard`.
+
+The contract a model (in tree or a plugin) implements:
+
+* `CommManager(query_sharded=mapping.attn.has_qcp)` — declares that the
+  model slices its rows by `ctx.query_shard`; a model that does not slice
+  passes `False` and is refused at construction under a sharding mapping.
+  The attention weights are head-replicated under this mapping, so the
+  attention legs (`pre_attn_comm`, `gather_residual`, `post_attn_comm`,
+  `post_final_norm_comm`) are identity on every forward — a sharded extend
+  and the drafter's replicated decode steps alike — and
+  `needs_pre_attn_all_gather` / `needs_final_all_gather` are False: nothing
+  is ever scattered by attention. The dense and MoE legs follow the
+  forward: with a shard, the existing all-gather / reduce-scatter legs over
+  `plan.rows_for_collective(ctx.collective_num_tokens)` (the shard rows, or
+  the sampled rows after a draft's narrowing); without one (decode steps,
+  idle), the replicated all-reduce legs — which is why dense TP and the MoE
+  TP×EP group must each be 1 or the attention TP width (`validate_qcp`, and
+  the manager refuses other mappings). The row-layout conversions
+  (`slice_scattered_rows`, `gather_scattered_rows`) are identity on a sharded
+  forward, whose rows are the scattered share already. Fusion off.
+* `VocabParallelEmbedding.forward(input_ids, query_shard=ctx.query_shard)`:
+  the ids a rank embeds are its shard, so the layer all-gathers the ids to
+  the span for its vocab shard, sums the shards and reduce-scatters the rows
+  back (the same bytes as the replicated all-reduce). A model passes the
+  shard explicitly; the default (`None`) is the replicated lookup.
+* `PagedAttention.latent_prologue(..., key_rows=QueryShardGather(ctx.query_shard,
+  mapping.attn.qcp_group))` (through `DeepseekV3AttentionMLA.forward_absorb_qkv_proj`
+  automatically): the prologue rotates the local rows without a cache
+  (`mla_prologue(cache=None)`), all-gathers the rotated latent to the whole
+  span with the plan's row counts and stores it owner-masked
+  (`latent_store`); `slots` is the whole span. A rank whose shard is empty
+  rotates nothing but joins the gather and the store, so a model must reach
+  the prologue (and every other QCP collective: the index-K gather, each
+  group's history gathers) with zero rows rather than return early; the
+  dense MLA path (`DeepseekV3AttentionMLA.forward`, the expanded prologue)
+  refuses a shard up front. Index-K the model gathers the same way
+  (`token_all_gather` of the local keys before quantization) and writes
+  with the owner mask.
+* GPU DSA (`backends/paged/dsa.py`): `init_forward_metadata` builds a
+  `DSAQueryShardMetadata` — request groups whose summed history fits the
+  gather workspace (one whole history, reserved from the cache budget by the
+  recipe's `workspace_bytes`, allocated once on the target tree by
+  `registry._prepare_fixed_workspaces` and shared with the draft tree, whose
+  extend step never gathers concurrently), each with its `row_base` in the request-major
+  history-row numbering, this rank's `local_query` slice and a
+  `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
+  `dcp/placement.py: owned_history_rows`). For the indexer the model calls
+  `backend.gather_history_index_k(layer_id, pool, group)` per group and
+  `dsa_prefill_topk(q_local, w_local, group.gather.virtual_slots,
+  row_starts_local, row_ends_local, index_k_fp8=, index_k_scale=, ...)`,
+  adds `group.row_base` to the returned rows, and hands
+  `forward_sparse_prefill(topk_slots=<workspace rows>)` the local rows;
+  the arm gathers every group's KV (`gather_history_kv`, a collective every
+  rank joins even without rows in the group) and attends the local rows with
+  every head, `return_lse=False`, no combine. The gathered buffer handed to
+  `dsa_prefill` as a flat `[slots, dim]` cache is a whole number of kernel
+  pages (the workspace rows are padded by
+  `dsa_history_gather_workspace_rows`), so the paged solutions' view of it
+  holds too and no solution is wrong at runtime; the padding rows are never
+  selected. The history gathers move any row dtype (packed uint8 index-K
+  rows, fp32 scales) as bf16 pairs of their bytes, since the token
+  all-gather's low-latency solution is bf16-only. The decode arm (the
+  drafter's steps) keeps the DCP combine; its form follows the layer's head
+  count against the attention config (`keep_all_heads` when
+  `layer.tp_q_head_num` is every head — head-replicated weights — the
+  gather-and-reduce-scatter form when it is the attention-TP slice; any other
+  count is refused), never a mapping assumption.
+* The model exit (`BaseCausalLM.exit_logits`, or `gather_sampled_rows` +
+  `ctx.logits_rows_selected = True`) gathers only the sampled rows; a FULL
+  hidden capture stays the shard. `ctx.gather_ids` keeps the batch's full
+  layout on every forward, the drafters' extend steps included (Eagle's
+  step 0 and every depth of the multi-depth `Mtp` drafter read the shard's
+  slice of the shifted prefill ids and positions, chain the shard's hidden
+  rows, and carry the plan on their context; `Mtp` sums its cross-chunk
+  stash of target hiddens over the group, one owner per row):
+  `QueryShardPlan.local_sampled_ids(ctx.gather_ids)` is the one place that
+  cuts them to the shard, used by `gather_sampled_rows` and by any model
+  that narrows to its live rows itself. A draft model's FULL capture under
+  a shard is the shard's rows, which is what the next depth consumes.
+
+Eager only: the history gather runs in the attention break, so
+`--prefill-context-parallel-size > 1` requires `--disable-prefill-graph`
+(the executor also refuses to replay a prefill graph for a sharded forward).
+A graph-capable form needs equal padding on every rank so the gathers are
+even collectives inside the captured segment. MIXED rounds, attention DP,
+non-prefill roles, a non-bf16 KV cache (the gathered write is
+`latent_store`, native rows only) and dense / MoE groups that are neither 1
+nor the attention TP width are refused at argument resolution
+(`validate_qcp`); `AttnConfig` repeats the attention-family and KV-cache
+checks where the config is built.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path
@@ -1383,6 +1499,18 @@ mapping remains a separate consumer of the shared mapping helpers
   path.
 * `grep -rn "init_forward_metadata_replay_cuda_graph\|is_all_greedy" python/`
   must stay empty.
+* `grep -rn "ENABLE_CP\|CP_METADATA" python/` must stay empty — the
+  module-global context-parallel switch and its process-wide metadata holder
+  were deleted; a parallel layout is a `Mapping` fact from an explicit server
+  argument and per-forward row metadata rides `ForwardContext`.
+* Every `init_forward_metadata` signature carries `query_shard` with no
+  default (`test_unified_decode_path.py` binds it on every runner-facing node
+  and leaf; leaves also take `page_table_cpu`), and
+  `grep -rn "input_num_tokens" python/tokenspeed/runtime/models/longcat_flash.py
+  python/tokenspeed/runtime/models/base/causal_lm.py` stays empty — a model
+  under query context parallelism reads its row count from its tensors or
+  `ctx.query_shard`, never from the scheduler's chunk count
+  (`test/runtime/distributed/test_query_shard.py`).
 * `grep -rn "ctx.accept_lengths\|ctx.draft_seq_lens_buf\|_apply_correction"
   python/` must stay empty — the step-0 accepted prefix is published through
   `ctx.draft_narrowing.publish_accepted_prefix()`, never computed in a model

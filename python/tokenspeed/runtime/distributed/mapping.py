@@ -48,13 +48,26 @@ def _resolve_parallelism_sizes(world_size: int, *sizes: int | None) -> tuple[int
     return tuple(resolved)
 
 
-def _resolve_dcp_size(tp_size: int, cp_size: int, dcp_size: int) -> int:
+def _resolve_dcp_size(tp_size: int, dcp_size: int) -> int:
     """Validate DCP within resolved attention TP; DCP adds no world-size dimension."""
     if isinstance(dcp_size, bool) or not isinstance(dcp_size, int) or dcp_size < 1:
         raise ValueError("dcp_size must be a positive integer")
     if tp_size % dcp_size:
         raise ValueError("attention TP size must be divisible by DCP size")
     return dcp_size
+
+
+def _resolve_qcp_size(tp_size: int, qcp_size: int) -> int:
+    """Validate query context parallelism within resolved attention TP.
+
+    QCP shards an extend forward's query rows over a consecutive subgroup of
+    attention TP; it adds no world-size dimension.
+    """
+    if isinstance(qcp_size, bool) or not isinstance(qcp_size, int) or qcp_size < 1:
+        raise ValueError("qcp_size must be a positive integer")
+    if tp_size % qcp_size:
+        raise ValueError("attention TP size must be divisible by QCP size")
+    return qcp_size
 
 
 def _make_parallelism_rank(rank: int, size: int, stride: int = 1) -> int:
@@ -140,14 +153,14 @@ class DenseLayerMapping(MappingBase):
 
 
 def _resolve_head_tp_size(
-    tp_size: int, cp_size: int, world_size: int, head_tp_size: int | None
+    tp_size: int, world_size: int, head_tp_size: int | None
 ) -> int:
     """Resolve the attention head-TP width.
 
     ``None`` keeps the head projections on the attention TP group (today's
     layout). A wider head group shards ``q_b_proj`` / ``kv_b_proj`` /
     ``o_proj`` by heads over ranks that are data-parallel for attention, so
-    it requires attention TP 1 and CP 1 and must tile the stage world.
+    it requires attention TP 1 and must tile the stage world.
     """
     if head_tp_size is None:
         return tp_size
@@ -164,8 +177,6 @@ def _resolve_head_tp_size(
             "attention head TP shards heads over data-parallel ranks and needs "
             f"attention TP 1, got attn_tp_size={tp_size}"
         )
-    if cp_size != 1:
-        raise ValueError("attention head TP is incompatible with attention CP")
     if world_size % head_tp_size:
         raise ValueError(
             f"attention head TP size {head_tp_size} must divide the stage "
@@ -181,20 +192,21 @@ class AttentionLayerMapping(MappingBase):
         rank: int | None = None,
         world_size: int = 1,
         tp_size: int | None = None,
-        cp_size: int | None = None,
         dp_size: int | None = None,
         dcp_size: int = 1,
         head_tp_size: int | None = None,
+        qcp_size: int = 1,
     ):
         super().__init__(rank, world_size)
-        self.tp_size, self.cp_size, self.dp_size = _resolve_parallelism_sizes(
-            self.world_size, tp_size, cp_size, dp_size
+        self.tp_size, self.dp_size = _resolve_parallelism_sizes(
+            self.world_size, tp_size, dp_size
         )
-        self.dcp_size = _resolve_dcp_size(self.tp_size, self.cp_size, dcp_size)
+        self.dcp_size = _resolve_dcp_size(self.tp_size, dcp_size)
+        self.qcp_size = _resolve_qcp_size(self.tp_size, qcp_size)
         # Width of the group the head projections (q_b/kv_b/o_proj) shard
         # over. Equal to tp_size unless head TP widens it over DP ranks.
         self.head_tp_size = _resolve_head_tp_size(
-            self.tp_size, self.cp_size, self.world_size, head_tp_size
+            self.tp_size, self.world_size, head_tp_size
         )
 
     @property
@@ -216,6 +228,20 @@ class AttentionLayerMapping(MappingBase):
     @property
     def has_dcp(self) -> bool:
         return self.dcp_size > 1
+
+    @property
+    def has_qcp(self) -> bool:
+        return self.qcp_size > 1
+
+    @cached_property
+    def qcp_rank(self) -> int:
+        """Rank within the consecutive query-context-parallel subgroup of
+        attention TP; it is this rank's query shard."""
+        return _make_parallelism_rank(self.rank, self.qcp_size, stride=1)
+
+    @cached_property
+    def qcp_group(self) -> Group:
+        return _make_parallelism_group(self.rank, self.qcp_size, stride=1)
 
     @cached_property
     def dcp_rank(self) -> int:
@@ -245,40 +271,22 @@ class AttentionLayerMapping(MappingBase):
         return _make_parallelism_group(self.rank, self.tp_size, stride=1)
 
     @cached_property
-    def has_cp(self) -> bool:
-        return self.cp_size > 1
-
-    @cached_property
-    def cp_rank(self) -> int:
-        return _make_parallelism_rank(self.rank, self.cp_size, stride=self.tp_size)
-
-    @cached_property
-    def cp_group(self) -> Group:
-        return _make_parallelism_group(self.rank, self.cp_size, stride=self.tp_size)
-
-    @cached_property
     def has_dp(self) -> bool:
         return self.dp_size > 1
 
     @cached_property
     def dp_rank(self) -> int:
-        return _make_parallelism_rank(
-            self.rank, self.dp_size, stride=self.tp_size * self.cp_size
-        )
+        return _make_parallelism_rank(self.rank, self.dp_size, stride=self.tp_size)
 
     @cached_property
     def dp_group(self) -> Group:
-        return _make_parallelism_group(
-            self.rank, self.dp_size, stride=self.tp_size * self.cp_size
-        )
+        return _make_parallelism_group(self.rank, self.dp_size, stride=self.tp_size)
 
     def scatter_index(self, rank: int) -> int:
         """Index of ``rank`` in a dp-major/tp-minor scattered token count
-        table; cp peers share their dp group's tp split."""
+        table."""
         tp_rank = _make_parallelism_rank(rank, self.tp_size, stride=1)
-        dp_rank = _make_parallelism_rank(
-            rank, self.dp_size, stride=self.tp_size * self.cp_size
-        )
+        dp_rank = _make_parallelism_rank(rank, self.dp_size, stride=self.tp_size)
         return dp_rank * self.tp_size + tp_rank
 
 
@@ -534,11 +542,11 @@ class Mapping(MappingBase):
         world_size: int = 1,
         *,
         attn_tp_size: int | None = None,
-        attn_cp_size: int | None = None,
         attn_dp_size: int | None = None,
         attn_dcp_size: int = 1,
         attn_head_tp_size: int | None = None,
         lm_head_tp_size: int | None = None,
+        attn_qcp_size: int = 1,
         dense_tp_size: int | None = None,
         dense_dp_size: int | None = None,
         moe_tp_size: int | None = None,
@@ -578,10 +586,10 @@ class Mapping(MappingBase):
             rank=rank,
             world_size=stage_world_size,
             tp_size=attn_tp_size,
-            cp_size=attn_cp_size,
             dp_size=attn_dp_size,
             dcp_size=attn_dcp_size,
             head_tp_size=attn_head_tp_size,
+            qcp_size=attn_qcp_size,
         )
         self.lm_head = LmHeadMapping(
             rank=rank,
@@ -682,10 +690,6 @@ class Mapping(MappingBase):
         return self.attn.has_tp
 
     @cached_property
-    def has_attn_cp(self) -> bool:
-        return self.attn.has_cp
-
-    @cached_property
     def has_attn_dp(self) -> bool:
         return self.attn.has_dp
 
@@ -707,7 +711,9 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Pipeline: pp={self.pp_size}",
-            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}  head_tp={self.attn.head_tp_size}",
+            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  "
+            f"qcp={self.attn.qcp_size}  dp={self.attn.dp_size}  "
+            f"head_tp={self.attn.head_tp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  LM head : tp={self.lm_head.tp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",

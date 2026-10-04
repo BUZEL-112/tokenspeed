@@ -30,6 +30,43 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_count
+
+
+def gather_sampled_rows(
+    hidden_states: torch.Tensor, ctx: ForwardContext, *, group: tuple[int, ...]
+) -> torch.Tensor:
+    """Gather the sampled rows of a sharded extend forward to every rank.
+
+    The last row of every request (``ctx.gather_ids``, the batch's full
+    layout, sorted) lives on exactly one rank; each rank selects the ones
+    inside its shard (``QueryShardPlan.local_sampled_ids``) and one
+    all-gather with the plan's per-rank sampled-row counts concatenates them
+    in rank order, which is request order. The model sets
+    ``ctx.logits_rows_selected`` afterwards so the logits processor takes the
+    ``[bs, hidden]`` rows as given.
+
+    Args:
+        hidden_states: ``[local_rows, hidden]`` this rank's final rows.
+        ctx: The forward, with ``query_shard`` and the full-layout
+            ``gather_ids`` set.
+        group: The query-context-parallel group.
+
+    Returns:
+        ``[bs, hidden]`` sampled rows in request order, on every rank.
+    """
+    plan = ctx.query_shard
+    if plan is None:
+        raise ValueError("gather_sampled_rows needs a sharded forward")
+    if ctx.gather_ids is None:
+        raise ValueError("gather_sampled_rows needs ctx.gather_ids")
+    if hidden_states.shape[0] != plan.local_rows:
+        raise ValueError(
+            f"query shard rank {plan.rank} holds {plan.local_rows} rows, got "
+            f"{hidden_states.shape[0]}"
+        )
+    local = hidden_states.index_select(0, plan.local_sampled_ids(ctx.gather_ids))
+    return token_all_gather(local, group, list(plan.sampled_rows_per_rank))
 
 
 def moe_input_row_segments(
@@ -77,7 +114,7 @@ def moe_input_row_segments(
         """``(padded, live, tp_rank)`` of ``rank``'s attention-DP group."""
         dp_rank, tp_rank = divmod(attn.scatter_index(rank), attn.tp_size)
         # The count table is indexed by global rank with the DP stride.
-        first = dp_rank * attn.tp_size * attn.cp_size
+        first = dp_rank * attn.tp_size
         padded = int(padded_global_num_tokens[first])
         live = int(live_global_num_tokens[first])
         if not 0 <= live <= padded:
@@ -89,7 +126,7 @@ def moe_input_row_segments(
     def shard(rank: int) -> tuple[int, int]:
         """``rank``'s reduce-scatter shard: a contiguous run of its group's rows."""
         padded, live, tp_rank = dp_group_rows(rank)
-        lengths = CommManager._scatter_count(padded, attn.tp_size)
+        lengths = scatter_count(padded, attn.tp_size)
         offset = sum(lengths[:tp_rank])
         return lengths[tp_rank], min(max(live - offset, 0), lengths[tp_rank])
 
@@ -147,6 +184,22 @@ def forward_collective_row_table(ctx: ForwardContext) -> list[int] | None:
 class CommManager:
     """Manages communication patterns (all_reduce vs RSAG) for each decoder layer.
 
+    ``query_sharded`` declares the model slices its extend rows by
+    ``ctx.query_shard`` (query context parallelism). Under that mapping the
+    attention weights are head-replicated on every rank, so an attention
+    output row is complete wherever it is computed and the attention legs
+    are identity on every forward -- a sharded extend and the drafter's
+    replicated decode steps alike; nothing is ever scattered by attention,
+    so nothing is gathered before it or at the final norm either. The dense
+    and MoE legs follow the forward: with a shard they run the existing
+    all-gather / reduce-scatter path over the shard's per-rank row table,
+    without one (decode steps, idle) the replicated all-reduce legs, which
+    is why dense TP and the MoE TP x EP group must each be 1 or the
+    attention TP width (``validate_qcp``). The model exit gathers only the
+    sampled rows. The flag must agree with ``mapping.attn.has_qcp``: a model
+    that does not slice its rows cannot run under a query-sharding mapping,
+    and one that does cannot run without it.
+
     ``dense_batch_invariant`` selects the TP-batch-invariant dense tail: the
     layer's ``down_proj`` is column-parallel on hidden and ``post_dense_comm``
     transposes its ``[T_full, H / W]`` output back to this rank's rows instead
@@ -162,13 +215,35 @@ class CommManager:
         dense_batch_invariant: bool,
         input_layernorm: torch.nn.Module | None = None,
         post_attn_layernorm: torch.nn.Module | None = None,
+        *,
+        query_sharded: bool,
     ) -> None:
+        if query_sharded != mapping.attn.has_qcp:
+            raise ValueError(
+                f"CommManager(query_sharded={query_sharded}) disagrees with the "
+                f"attention mapping (qcp_size={mapping.attn.qcp_size}): a model "
+                "declares query sharding only when it slices its extend rows by "
+                "ctx.query_shard, and must when the mapping shards queries"
+            )
+        if query_sharded and (
+            mapping.dense.tp_size not in (1, mapping.attn.tp_size)
+            or mapping.moe.tp_ep_size not in (1, mapping.attn.tp_size)
+        ):
+            # A replicated-row forward (the drafter's decode steps) keeps its
+            # rows whole through attention, so a dense / MoE group narrower
+            # than attention TP would gather rows nobody scattered.
+            raise ValueError(
+                "query sharding needs dense TP and the MoE TP x EP group to be 1 "
+                f"or the attention TP width {mapping.attn.tp_size}; got dense "
+                f"{mapping.dense.tp_size}, MoE {mapping.moe.tp_ep_size}"
+            )
         self.mapping = mapping
         self.layer_id = layer_id
         self.is_moe = is_moe
         self.prev_is_moe = prev_is_moe
         self.input_layernorm = input_layernorm
         self.post_attn_layernorm = post_attn_layernorm
+        self.query_sharded = query_sharded
         # utils.env imports server_args, which imports this package: resolve
         # the launch options lazily, as the fusion predicates below do.
         from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -190,16 +265,30 @@ class CommManager:
 
     # ---- Scattered token counts ----
 
-    @staticmethod
-    def _scatter_count(num_tokens: int, tp_size: int) -> list[int]:
-        base, remainder = divmod(num_tokens, tp_size)
-        return [base + 1] * remainder + [base] * (tp_size - remainder)
+    def _shard(self, ctx: ForwardContext) -> QueryShardPlan | None:
+        """The forward's query shard when the rows this layer holds are a
+        shard; None for replicated rows."""
+        plan = ctx.query_shard
+        if plan is None or plan.size == 1:
+            return None
+        if not self.query_sharded:
+            raise RuntimeError(
+                "a query-sharded forward reached a CommManager whose model did "
+                "not declare query_sharded"
+            )
+        return plan
 
     def get_num_tokens(self, ctx: ForwardContext):
         scattered = self.scattered_num_tokens(ctx)
         return sum(scattered), max(scattered)
 
     def scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
+        plan = self._shard(ctx)
+        if plan is not None:
+            # The shard is the scattered table (attention DP is refused under
+            # query sharding, so one group); a model that narrowed its rows to
+            # the sampled rows reports that through collective_num_tokens.
+            return list(plan.rows_for_collective(ctx.collective_num_tokens))
         global_counts = (
             ctx.collective_global_num_tokens
             if ctx.collective_global_num_tokens is not None
@@ -209,20 +298,16 @@ class CommManager:
             scattered = []
             for attn_dp_rank in range(self.mapping.attn.dp_size):
                 # global_counts is indexed by global rank with dp stride
-                # tp_size * cp_size; cp peers report the same count.
-                num_tokens = global_counts[
-                    attn_dp_rank * self.mapping.attn.tp_size * self.mapping.attn.cp_size
-                ]
-                scattered.extend(
-                    self._scatter_count(num_tokens, self.mapping.attn.tp_size)
-                )
+                # tp_size.
+                num_tokens = global_counts[attn_dp_rank * self.mapping.attn.tp_size]
+                scattered.extend(scatter_count(num_tokens, self.mapping.attn.tp_size))
             return scattered
         num_tokens = (
             ctx.collective_num_tokens
             if ctx.collective_num_tokens is not None
             else ctx.input_num_tokens
         )
-        return self._scatter_count(num_tokens, self.mapping.attn.tp_size)
+        return scatter_count(num_tokens, self.mapping.attn.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         start = self.mapping.attn.tp_size * self.mapping.attn.dp_rank
@@ -271,9 +356,12 @@ class CommManager:
         return self.mapping.attn.tp_size == self.mapping.dense.tp_size
 
     def needs_pre_attn_all_gather(self) -> bool:
-        """Whether attention preparation must gather the previous layer's rows."""
+        """Whether attention preparation must gather the previous layer's rows
+        (replicated-row layouts whose attention legs reduce-scatter; a
+        query-sharded model's attention never scatters, so never)."""
         return (
-            self.layer_id > 0
+            not self.query_sharded
+            and self.layer_id > 0
             and self.mapping.has_attn_tp
             and not self.use_all_reduce(self.prev_is_moe)
         )
@@ -303,12 +391,18 @@ class CommManager:
     # An all-reduce layer holds every row of its attention DP group on each
     # attention-TP rank; an RSAG layer holds this rank's scattered share. The
     # two helpers below convert between the layouts for a model whose MLPs do
-    # not all follow one pattern (LongCat runs a MoE beside dense MLPs).
+    # not all follow one pattern (LongCat runs a MoE beside dense MLPs). On a
+    # sharded forward the rows a layer holds ARE the scattered share and no
+    # layer ever holds full rows, so both conversions are identity there; a
+    # model never branches on the shard for its row layout.
 
     def slice_scattered_rows(
         self, hidden_states: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
-        """Keep this rank's scattered share of the full rows (no collective)."""
+        """Keep this rank's scattered share of the full rows (no collective);
+        identity on a sharded forward, whose rows are already the share."""
+        if self._shard(ctx) is not None:
+            return hidden_states
         token_list = self.attn_tp_group_scattered_num_tokens(ctx)
         if hidden_states.shape[0] != sum(token_list):
             raise RuntimeError(
@@ -322,7 +416,10 @@ class CommManager:
     def gather_scattered_rows(
         self, hidden_states: torch.Tensor, ctx: ForwardContext
     ) -> torch.Tensor:
-        """All-gather the scattered shares back into full rows."""
+        """All-gather the scattered shares back into full rows; identity on a
+        sharded forward, which never holds full rows."""
+        if self._shard(ctx) is not None:
+            return hidden_states
         token_list = self.attn_tp_group_scattered_num_tokens(ctx)
         if hidden_states.shape[0] != token_list[self.mapping.attn.tp_rank]:
             raise RuntimeError(
@@ -341,7 +438,10 @@ class CommManager:
     def post_attn_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
-        if not self.mapping.has_attn_tp:
+        # A query-sharded model's attention weights are head-replicated, so
+        # its output rows are complete on every forward (sharded extend or
+        # replicated decode step): nothing to reduce or scatter.
+        if self.query_sharded or not self.mapping.has_attn_tp:
             return hidden_states, residual
 
         if self.use_all_reduce(self.is_moe):
@@ -383,7 +483,7 @@ class CommManager:
         if not self.mapping.dense.has_tp:
             return hidden_states
 
-        if self.use_all_reduce(is_moe=False):
+        if self._shard(ctx) is None and self.use_all_reduce(is_moe=False):
             return hidden_states
 
         return token_all_gather(
@@ -396,7 +496,7 @@ class CommManager:
         if not self.mapping.moe.has_tp_ep:
             return hidden_states
 
-        if self.use_all_reduce(is_moe=True):
+        if self._shard(ctx) is None and self.use_all_reduce(is_moe=True):
             return hidden_states
 
         return token_all_gather(
@@ -419,7 +519,7 @@ class CommManager:
         if not self.mapping.dense.has_tp:
             return hidden_states, residual
 
-        if self.use_all_reduce(is_moe=False):
+        if self._shard(ctx) is None and self.use_all_reduce(is_moe=False):
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
             return hidden_states, residual
         if self.dense_batch_invariant:
@@ -454,15 +554,20 @@ class CommManager:
         if not self.mapping.moe.has_tp_ep:
             return hidden_states, residual
 
+        # A query shard always took the all-gather leg in pre_moe_comm, so it
+        # takes the reduce-scatter back -- or, under the slot-ordered combine,
+        # the shard's rows out of the combined span: ``replicated`` is the one
+        # predicate both branches follow, never ``use_all_reduce`` alone.
+        replicated = self._shard(ctx) is None and self.use_all_reduce(is_moe=True)
         if self.moe_combine_order == "slot":
-            if self.use_all_reduce(is_moe=True):
+            if replicated:
                 return hidden_states, residual
             token_list = self.moe_tp_ep_group_scattered_num_tokens(ctx)
             offset = sum(token_list[: self.mapping.moe.tp_ep_rank])
             own = token_list[self.mapping.moe.tp_ep_rank]
             return hidden_states[offset : offset + own], residual
 
-        if self.use_all_reduce(is_moe=True):
+        if replicated:
             hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
@@ -473,8 +578,27 @@ class CommManager:
         return hidden_states, residual
 
     def needs_final_all_gather(self) -> bool:
-        """Whether the model output must gather the final layer's rows."""
-        return self.mapping.has_attn_tp and not self.use_all_reduce(self.is_moe)
+        """Whether the model output must gather the final layer's rows
+        (replicated-row layouts whose attention legs reduce-scatter; a
+        query-sharded model never scatters, and gathers sampled rows at the
+        model exit instead, see :func:`gather_sampled_rows`)."""
+        return (
+            not self.query_sharded
+            and self.mapping.has_attn_tp
+            and not self.use_all_reduce(self.is_moe)
+        )
+
+    def gather_sampled_rows(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        """A sharded forward's model exit: every rank's sampled rows, request
+        order (:func:`gather_sampled_rows` over the query-context-parallel
+        group)."""
+        if self._shard(ctx) is None:
+            raise RuntimeError("gather_sampled_rows serves sharded forwards")
+        return gather_sampled_rows(
+            hidden_states, ctx, group=self.mapping.attn.qcp_group
+        )
 
     def post_final_norm_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
@@ -493,8 +617,11 @@ class CommManager:
     def use_all_reduce_norm_fusion(self) -> bool:
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
+        # A query-sharded model's rows are never replicated at the
+        # all-reduce boundary, so the fused all-reduce + norm has no place.
         return (
-            self.use_all_reduce(self.is_moe)
+            not self.query_sharded
+            and self.use_all_reduce(self.is_moe)
             and self.mapping.has_attn_tp
             and global_server_args_dict.get("enable_allreduce_fusion", False)
         )
