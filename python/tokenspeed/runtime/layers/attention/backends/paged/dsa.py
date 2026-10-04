@@ -28,8 +28,10 @@ from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode,
     dsa_plan,
     dsa_prefill,
+    select_dsa_prefill_topk_for_rows,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -47,7 +49,7 @@ from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_history_gather_workspace_rows,
-    dsa_index_k_row_bytes,
+    index_k_row_bytes,
 )
 from tokenspeed.runtime.layers.attention.dcp.cache import (
     HistoryGatherPlan,
@@ -177,15 +179,10 @@ class DSABackend(PagedAttentionBackend):
         self.qcp_rank = config.qcp_rank
         if len(self.qcp_group) > 1 and spec.index_kpool is not None:
             raise ValueError("DSA query context parallelism does not support KPool")
-        if len(self.qcp_group) > 1 and spec.index_k_format != "fp8_scaled":
-            # The history gather reads the fp8_scaled block-split plane
-            # (DSATokenToKVPool.gather_index_k_rows); the workspace plan
-            # (dsa_history_gather_workspace_bytes) refuses the same.
-            raise ValueError(
-                "DSA query context parallelism gathers fp8_scaled index-K rows; "
-                f"got index_k_format={spec.index_k_format!r}"
-            )
         self.index_head_dim = spec.index_head_dim
+        # The index-K plane's format (configs/dsa.py INDEX_K_FORMATS): the
+        # history gather packs rows in it and hands the indexer that form.
+        self.index_k_format = spec.index_k_format
         self.query_shard_metadata: DSAQueryShardMetadata | None = None
         # Allocated by the target leaf (preallocate_history_gather_workspace),
         # shared with the draft leaf (adopt_history_gather_workspace).
@@ -204,9 +201,10 @@ class DSABackend(PagedAttentionBackend):
         # rl-bitwise pins the sparse decode onto the batch-invariant no-split
         # leaves; without one registered, selection fails at the first decode
         # instead of silently serving an occupancy-split kernel.
-        self.kernel_solution: str | None = (
-            "aok" if global_server_args_dict["numerics"] in BITWISE_ENVELOPES else None
+        self.batch_invariant: bool = (
+            global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
+        self.kernel_solution: str | None = "aok" if self.batch_invariant else None
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
@@ -221,6 +219,44 @@ class DSABackend(PagedAttentionBackend):
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
+        if len(self.qcp_group) > 1:
+            self._probe_history_gather_topk_leaf(spec)
+
+    def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
+        """Select, at construction, the indexer leaf the sharded extend arm
+        will hand gathered index-K rows to.
+
+        Under query context parallelism the indexer scores each request
+        group's history as rows in workspace-row order of this leaf's
+        ``index_k_format`` (``gather_history_index_k``, then
+        ``dsa_prefill_topk(index_k_fp8=, index_k_scale=)`` or
+        ``(index_k_bf16=)``), which only a leaf declaring the kernel package's
+        ``index_k_workspace_rows`` feature for that format serves. Selection
+        would otherwise first run in the first sharded prefill; probing it here
+        turns a platform without such a leaf into a startup error. The probe
+        uses the forward's selection inputs this leaf knows: the model dtype
+        for the indexer query, fp32 weights, the spec's indexer geometry, this
+        leaf's page size, and the envelope's batch-invariance and solution pin.
+        """
+        try:
+            select_dsa_prefill_topk_for_rows(
+                index_k_format=self.index_k_format,
+                q_dtype=self.q_data_type,
+                weights_dtype=torch.float32,
+                index_heads=spec.index_n_heads,
+                head_dim=self.index_head_dim,
+                topk=self.index_topk,
+                page_size=self.kernel_page_size,
+                batch_invariant=self.batch_invariant,
+                solution=self.kernel_solution,
+            )
+        except NoKernelFoundError as e:
+            raise NoKernelFoundError(
+                "DSA query context parallelism hands the indexer gathered "
+                f"index-K rows of index_k_format={self.index_k_format!r}; no "
+                "dsa_prefill_topk leaf declaring the index_k_workspace_rows "
+                f"feature for that format is registered on this platform: {e}"
+            ) from e
 
     def configure_runtime(
         self,
@@ -255,12 +291,14 @@ class DSABackend(PagedAttentionBackend):
             kv=torch.empty(
                 (rows, self.kv_cache_dim), dtype=self.data_type, device=self.device
             ),
-            # Packed index-K rows (FP8 bytes then fp32 scales), one gather per group.
+            # Index-K rows packed in the plane's format (FP8 bytes then fp32
+            # scales, or bf16 keys), one gather per group.
             index_k=torch.empty(
-                (rows, dsa_index_k_row_bytes(self.index_head_dim)),
+                (rows, index_k_row_bytes(self.index_head_dim, self.index_k_format)),
                 dtype=torch.uint8,
                 device=self.device,
             ),
+            index_k_format=self.index_k_format,
         )
         return self._history_workspace.nbytes
 
@@ -271,22 +309,24 @@ class DSABackend(PagedAttentionBackend):
         """Gather into another leaf's workspace (the draft into the target's).
 
         The two leaves must agree on the row geometry the gathers write:
-        latent width and dtype, packed index-K row bytes, and whole kernel
-        pages of this leaf's page size.
+        latent width and dtype, the index-K format and its packed row bytes,
+        and whole kernel pages of this leaf's page size.
         """
+        row_bytes = index_k_row_bytes(self.index_head_dim, self.index_k_format)
         if (
             workspace.kv.shape[1] != self.kv_cache_dim
             or workspace.kv.dtype != self.data_type
-            or workspace.index_k.shape[1] != dsa_index_k_row_bytes(self.index_head_dim)
+            or workspace.index_k_format != self.index_k_format
+            or workspace.index_k.shape[1] != row_bytes
             or workspace.rows % self.kernel_page_size
         ):
             raise ValueError(
                 "history gather workspace geometry mismatch: "
                 f"kv {tuple(workspace.kv.shape)} {workspace.kv.dtype}, index_k "
-                f"{tuple(workspace.index_k.shape)}, rows {workspace.rows}; this "
-                f"leaf gathers [{self.kv_cache_dim}] {self.data_type} latent, "
-                f"{dsa_index_k_row_bytes(self.index_head_dim)}-byte index-K rows "
-                f"in pages of {self.kernel_page_size}"
+                f"{tuple(workspace.index_k.shape)} {workspace.index_k_format}, "
+                f"rows {workspace.rows}; this leaf gathers [{self.kv_cache_dim}] "
+                f"{self.data_type} latent, {row_bytes}-byte {self.index_k_format} "
+                f"index-K rows in pages of {self.kernel_page_size}"
             )
         self._history_workspace = workspace
 
@@ -716,21 +756,31 @@ class DSABackend(PagedAttentionBackend):
 
     def gather_history_index_k(
         self, layer_id: int, token_to_kv_pool, group: QueryShardHistoryGroup
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Assemble one group's index-K rows: ``[rows, index_head_dim]`` FP8
-        bytes and ``[rows, groups]`` fp32 scales in position order, the
-        ``index_k_fp8`` / ``index_k_scale`` inputs of ``dsa_prefill_topk``
-        (views of the gather workspace). One collective over the page owners
-        moves the rows packed (FP8 bytes then scale bytes per row)."""
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Assemble one group's index-K rows in position order, in this leaf's
+        ``index_k_format`` (the pool read, the workspace rows and the split
+        all follow it), as the rows ``dsa_prefill_topk`` takes in
+        workspace-row order: ``fp8_scaled`` gives ``[rows, index_head_dim]``
+        FP8 bytes and ``[rows, groups]`` fp32 scales (``index_k_fp8`` /
+        ``index_k_scale``); ``bf16`` gives ``[rows, index_head_dim]`` bf16 keys
+        and ``None`` (``index_k_bf16``). Views of the gather workspace, valid
+        until the next group's gather. One collective over the page owners
+        moves the rows packed as bytes."""
         if self._history_workspace is None:
             raise RuntimeError("DSA history gather workspace is not allocated")
         packed = token_to_kv_pool.gather_index_k_rows(
-            layer_id, group.gather.local_fetch_slots
+            layer_id,
+            group.gather.local_fetch_slots,
+            index_k_format=self.index_k_format,
         )
         gathered = gather_history_rows(
             group.gather, packed, out=self._history_workspace.index_k
         )
-        return split_index_k_rows(gathered, index_head_dim=self.index_head_dim)
+        return split_index_k_rows(
+            gathered,
+            index_head_dim=self.index_head_dim,
+            index_k_format=self.index_k_format,
+        )
 
     # ------------------------------------------------------------------
     # Validation helpers

@@ -1405,10 +1405,29 @@ The contract a model (in tree or a plugin) implements:
   history-row numbering, this rank's `local_query` slice and a
   `HistoryGatherPlan` (per-owner row counts from `page_table_cpu`,
   `dcp/placement.py: owned_history_rows`). For the indexer the model calls
-  `backend.gather_history_index_k(layer_id, pool, group)` per group and
-  `dsa_prefill_topk(q_local, w_local, group.gather.virtual_slots,
-  row_starts_local, row_ends_local, index_k_fp8=, index_k_scale=, ...)`,
-  adds `group.row_base` to the returned rows, and hands
+  `backend.gather_history_index_k(layer_id, pool, group)` per group, which
+  returns the group's index keys in position order in the leaf's
+  `index_k_format` (`DSAConfig.index_k_format`; the pool read
+  `gather_index_k_rows(..., index_k_format=)` refuses a plane of another
+  dtype): `fp8_scaled` gives `(fp8 [rows, head_dim] uint8, scales [rows,
+  head_dim / 128] fp32)`, `bf16` gives `(keys [rows, head_dim] bf16, None)`.
+  The model hands them to `dsa_prefill_topk(q_local, w_local,
+  group.gather.virtual_slots, row_starts_local, row_ends_local, ...)` as the
+  rows in workspace-row order of that format -- `index_k_fp8=, index_k_scale=`
+  or `index_k_bf16=` -- never with `index_k_cache`; the facade routes the
+  rows by the `index_k_format` trait and requires the
+  `index_k_workspace_rows` feature (`dsa.INDEX_K_WORKSPACE_ROWS_FEATURE`),
+  so only a leaf whose launcher takes rows of that format is selected and
+  handed the row keywords (the in-tree DeepGEMM leaf for the FP8 pair; a
+  plugin's bf16 leaf declares the feature beside `index_k_format={"bf16"}`
+  and takes the `index_k_bf16` keyword), and an override cannot force a
+  plane-only leaf onto rows. The leaf probes that selection at construction
+  (`DSABackend.__init__` under `qcp_size > 1`,
+  `dsa.select_dsa_prefill_topk_for_rows` with the configured format, page
+  size, indexer geometry and the envelope's batch-invariance and solution
+  pin), so a platform without a declaring leaf is a `NoKernelFoundError` at
+  startup rather than in the first sharded prefill. The
+  model adds `group.row_base` to the returned rows and hands
   `forward_sparse_prefill(topk_slots=<workspace rows>)` the local rows;
   the arm gathers every group's KV (`gather_history_kv`, a collective every
   rank joins even without rows in the group) and attends the local rows with
@@ -1417,9 +1436,16 @@ The contract a model (in tree or a plugin) implements:
   pages (the workspace rows are padded by
   `dsa_history_gather_workspace_rows`), so the paged solutions' view of it
   holds too and no solution is wrong at runtime; the padding rows are never
-  selected. The history gathers move any row dtype (packed uint8 index-K
-  rows, fp32 scales) as bf16 pairs of their bytes, since the token
-  all-gather's low-latency solution is bf16-only. The sparse cores take
+  selected. The history gathers move any row dtype (uint8 index-K rows
+  packed in the plane's format -- FP8 bytes then fp32 scales, or bf16 key
+  bytes -- fp32 scales, fp8 latent) as bf16 pairs of their bytes, since the
+  token all-gather's low-latency solution is bf16-only; the workspace
+  (`HistoryGatherWorkspace`, `index_k_format` recorded, rows of
+  `index_k_row_bytes(head_dim, format)`) is sized by the recipe and
+  allocated by the leaf from the same formula; the recipe refuses a draft
+  whose `index_k_format` differs from the target's, naming both, since the
+  two share one workspace, and the adopting leaf checks the recorded format
+  with the rest of the geometry. The sparse cores take
   their head count from the query, never from `layer.tp_q_head_num` or a
   mapping assumption (`DSABackend._query_heads`: the model's heads or the
   attention-TP slice, any other count refused), so one model layer serves a
