@@ -52,6 +52,9 @@ from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import (
+    get_all2all_backend as _get_all2all_backend,
+)
 from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig as _QuantizationConfig,
 )
@@ -222,12 +225,29 @@ class _RuntimeLongcatMoE(nn.Module):
         self.zero_expert_num = config.zero_expert_num
         self.zero_expert_type = config.zero_expert_type
         self.routed_scaling_factor = config.routed_scaling_factor
+        # The routed output leaves this module as one partial per MoE TP-EP
+        # rank and post_moe_comm sums the group (all-reduce or reduce-scatter),
+        # so the identity zero-expert residual, which every rank could compute
+        # from its replicated input, must enter exactly one partial.
+        self.adds_zero_expert_residual: bool = self.mapping.moe.tp_ep_rank == 0
         self.stream_fork = _StreamFork(alt_stream)
 
         if self.mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
                 f"EP size {self.mapping.moe.ep_size} is greater than the number "
                 f"of LongCat routed experts {config.n_routed_experts}."
+            )
+        if _get_all2all_backend().is_deepep():
+            # The decoder layer gathers the MoE input over the MoE TP-EP group
+            # and reduces the routed output through post_moe_comm, and the
+            # identity zero-expert residual enters one rank's partial on that
+            # assumption. DeepEP's combine already reduces inside the kernel
+            # and keeps each rank's own token rows, so the two cannot compose.
+            raise ValueError(
+                "LongCat-Flash does not support --all2all-backend deepep: its MoE "
+                "layer reduces the routed output through the host's MoE "
+                "all-reduce / reduce-scatter, which DeepEP's in-kernel combine "
+                "already performs; launch with --all2all-backend none"
             )
         if config.hidden_act != "silu":
             raise ValueError(
@@ -280,11 +300,8 @@ class _RuntimeLongcatMoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             output_format=_TopKOutputFormat.STANDARD,
             zero_expert_num=config.zero_expert_num,
-            topk_indices_dtype=(
-                torch.int64
-                if global_server_args_dict.get("enable_deep_ep", False)
-                else torch.int32
-            ),
+            # DeepEP, the one consumer of int64 ids, is refused above.
+            topk_indices_dtype=torch.int32,
         )
 
     def get_moe_routed_weights(self):
@@ -295,6 +312,14 @@ class _RuntimeLongcatMoE(nn.Module):
         ]
 
     def _apply_zero_experts(self, hidden_states: torch.Tensor, topk_output):
+        """Mask the zero-expert slots out of the routing and return this rank's
+        share of the identity residual (None when it adds none).
+
+        The residual ``hidden * sum(zero-slot weights)`` is added to the routed
+        partial BEFORE post_moe_comm sums the partials over the MoE TP-EP
+        group, so only one rank (``adds_zero_expert_residual``) materializes
+        it; the others contribute exactly 0 and the reduction counts it once.
+        """
         if self.zero_expert_num <= 0:
             return None
 
@@ -312,6 +337,8 @@ class _RuntimeLongcatMoE(nn.Module):
         topk_output.topk_weights[zero_expert_mask] = 0.0
 
         if self.zero_expert_type in ("identity", "copy"):
+            if not self.adds_zero_expert_residual:
+                return None
             zero_weight = zero_expert_weights.sum(dim=-1, keepdim=True).to(
                 hidden_states.dtype
             )
@@ -360,6 +387,8 @@ class _RuntimeLongcatMoE(nn.Module):
             )
 
         if zero_expert_output is not None:
+            # Pre-reduction add: the caller's post_moe_comm sums this partial
+            # with the other MoE TP-EP ranks', which hold None here.
             routed_expert_output = routed_expert_output + zero_expert_output
         return routed_expert_output
 

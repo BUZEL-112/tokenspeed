@@ -103,21 +103,31 @@ class TestLongcatMixedFp8Config(unittest.TestCase):
             )
 
 
+def _zero_expert_moe(*, adds_residual: bool) -> _RuntimeLongcatMoE:
+    moe = object.__new__(_RuntimeLongcatMoE)
+    moe.zero_expert_num = 1
+    moe.n_routed_experts = 3
+    moe.zero_expert_type = "identity"
+    moe.adds_zero_expert_residual = adds_residual
+    return moe
+
+
+def _zero_expert_topk() -> StandardTopKOutput:
+    return StandardTopKOutput(
+        topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
+        topk_ids=torch.tensor([[0, -1], [3, 1]]),
+        router_logits=torch.zeros(2, 4),
+    )
+
+
 class TestLongcatZeroExpert(unittest.TestCase):
     def test_identity_zero_expert_masks_and_adds_hidden_state(self):
-        moe = object.__new__(_RuntimeLongcatMoE)
-        moe.zero_expert_num = 1
-        moe.n_routed_experts = 3
-        moe.zero_expert_type = "identity"
+        moe = _zero_expert_moe(adds_residual=True)
         hidden_states = torch.tensor(
             [[2.0, 4.0], [6.0, 8.0]],
             dtype=torch.float32,
         )
-        topk_output = StandardTopKOutput(
-            topk_weights=torch.tensor([[0.25, 0.75], [0.5, 0.5]]),
-            topk_ids=torch.tensor([[0, -1], [3, 1]]),
-            router_logits=torch.zeros(2, 4),
-        )
+        topk_output = _zero_expert_topk()
 
         zero_output = _RuntimeLongcatMoE._apply_zero_experts(
             moe,
@@ -138,8 +148,64 @@ class TestLongcatZeroExpert(unittest.TestCase):
             torch.tensor([[0, 0], [0, 1]]),
         )
 
+    def test_residual_enters_one_partial_of_the_moe_group(self):
+        # post_moe_comm sums the per-rank partials, so a rank other than the
+        # designated one masks the slots but adds nothing.
+        moe = _zero_expert_moe(adds_residual=False)
+        topk_output = _zero_expert_topk()
+
+        zero_output = _RuntimeLongcatMoE._apply_zero_experts(
+            moe, torch.ones(2, 2), topk_output
+        )
+
+        self.assertIsNone(zero_output)
+        torch.testing.assert_close(
+            topk_output.topk_weights,
+            torch.tensor([[0.25, 0.0], [0.0, 0.5]]),
+        )
+        torch.testing.assert_close(
+            topk_output.topk_ids,
+            torch.tensor([[0, 0], [0, 1]]),
+        )
+
 
 class TestLongcatMoePlan(unittest.TestCase):
+    def test_deepep_all2all_is_refused(self):
+        # The decoder layer reduces the routed output through the host's MoE
+        # all-reduce / reduce-scatter (and counts the zero-expert residual on
+        # that assumption); DeepEP's combine already reduces in the kernel.
+        from tokenspeed.runtime.distributed.mapping import Mapping
+        from tokenspeed.runtime.layers.moe import utils as moe_utils
+
+        config = SimpleNamespace(
+            hidden_size=16,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            zero_expert_num=0,
+            zero_expert_type="",
+            moe_topk=2,
+            hidden_act="silu",
+            routed_scaling_factor=1.0,
+            norm_topk_prob=False,
+            router_bias=False,
+            router_dtype="float32",
+        )
+        mapping = Mapping(rank=0, world_size=2, attn_tp_size=2, moe_ep_size=2)
+        with (
+            mock.patch.object(
+                moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.DEEPEP
+            ),
+            self.assertRaisesRegex(ValueError, "--all2all-backend deepep"),
+        ):
+            _RuntimeLongcatMoE(
+                config=config,
+                mapping=mapping,
+                quant_config=None,
+                layer_index=0,
+                prefix="model.layers.0.mlp",
+                alt_stream=None,
+            )
+
     def test_blackwell_ep4_plans_accept_zero_expert_routing(self):
         from tokenspeed_kernel.platform import current_platform
 
@@ -192,10 +258,7 @@ class TestLongcatMoePlan(unittest.TestCase):
             mock.patch.object(
                 moe_utils, "ALL2ALL_BACKEND", moe_utils.All2AllBackend.NONE
             ),
-            mock.patch.dict(
-                global_server_args_dict,
-                {"ep_num_redundant_experts": 0, "enable_deep_ep": False},
-            ),
+            mock.patch.dict(global_server_args_dict, {"ep_num_redundant_experts": 0}),
         ):
             for quant_config in (None, fp8_config):
                 with self.subTest(quantized=quant_config is not None):
