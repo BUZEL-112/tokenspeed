@@ -1991,7 +1991,7 @@ class ModelExecutor:
                 # The candidate-vs-target compare reads the window as a chain.
                 if (
                     LOG_SPEC_ACCEPT_LENGTHS
-                    and self.config.spec_num_steps
+                    and self.config.spec_algo is not None
                     and num_extends == 0
                     and self.tree_spec is None
                 ):
