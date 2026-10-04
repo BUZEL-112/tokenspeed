@@ -51,6 +51,129 @@ Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
 `--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
 wide-QKV MoonViT encoder at TP1 with whole-item DP8.
 
+### Decode-side TP layouts under attention DP
+
+An MLA decode engine runs attention at TP1 with DP across the world: the
+per-token latent KV cannot shard by heads, so every rank keeps its own KV.
+That layout replicates every non-MoE weight on every rank: the MLA head
+projections (`q_b_proj`, `kv_b_proj`, `o_proj`), the dense MLPs and the LM
+head. On a large model that is tens of GB per rank that could hold KV
+instead. Three knobs shard those weights over contiguous groups of DP ranks
+(one node, typically) while attention and the KV stay TP1/DP:
+
+| Parameter | Use |
+| --- | --- |
+| `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj` and `o_proj` by heads over `W` contiguous DP ranks. Requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). |
+| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
+| `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
+| `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
+
+`--attn-head-tp-size` is the one that changes the attention data flow. With
+`W` ranks holding `T_full` decode rows together and this rank owning `T_own`
+of them, each attention layer runs:
+
+1. token all-gather of the normalized q latent: `[T_own, q_lora]` to
+   `[T_full, q_lora]`;
+2. `q_b_proj` and the absorption on this rank's `H / W` heads:
+   `[T_full, H / W, kv_lora + rope]`;
+3. all-to-all, heads to tokens: `[T_own, H, kv_lora + rope]` -- every head
+   of this rank's own tokens;
+4. the attention prologue (RoPE, KV write) and core attention on this rank's
+   own KV, with the full head count;
+5. all-to-all, tokens to heads: `[T_full, H / W, kv_lora]`;
+6. the value projection with the local `w_vc`: `[T_full, H / W * v]`;
+7. the `o_proj` tail back to `[T_own, hidden]`: row-parallel `o_proj` and a
+   token reduce-scatter of the head partials, or, under
+   `--tp-batch-invariant attn`, an all-gather of the heads, the
+   column-parallel `o_proj` (`[T_full, hidden / W]`) and an all-to-all back
+   to this rank's rows.
+
+The head exchange precedes the prologue, so the prologue sees one row count
+for the query, the latent and the write slots (RoPE commutes with the head
+permutation); the KV write and any sparse-attention indexer stay as they are.
+The head group's ranks all take part in every leg, including a DP rank with
+no rows this step: it still owns a head shard of the group's tokens. That
+participation lives in the attention module alone -- every decoder layer
+calls its attention on an idle forward too, with its empty rows, and the
+attention joins the exchanges or returns at once depending on the layout --
+so no layer branches on the layout (the NextN and Eagle3 drafters' layers and
+LongCat's two-attention layer included). A head group whose ranks are all
+idle moves nothing and skips its collectives together. The exchange counts
+come from the gathered per-rank token tables, so there is no device sync: the
+legs up to core attention move the forward's input rows, the legs after it
+the rows a narrowing draft step reported as its collective sizing (one live
+row per request), and an idle rank sizes by the same tables. Decode CUDA
+graphs pad every DP rank to the same batch.
+
+**Decode rows only.** An expanded prefill needs every head's K and V for the
+cached prefix. Under head TP each rank holds `kv_b_proj` for its `H / W`
+heads and the latent cache for its own requests only, so no rank can expand
+the other heads of its prefix, and no other rank holds that prefix to expand
+it for it: the full-head K/V of a prefill is not available on the layout. The
+layout is therefore refused outside `--disaggregation-mode decode`, and the
+engine keeps every extend-shaped forward off its path:
+
+- startup tunes on a decode step instead of the usual extend-shaped dummy
+  forward, and the prefill CUDA graph (which records extend forwards) is
+  turned off (`--disable-prefill-graph` is set, with a log line);
+- the one prefill a decode node otherwise runs -- the local recovery after a
+  capacity retraction (`docs/design/scheduler.md`, sections 2 and 4) -- is
+  kept unreachable through the scheduler's own rule: a request whose declared
+  generation fits one retraction safe-step window (4096 new tokens) has its
+  whole generation reserved at admission and is never a retraction victim. A
+  head-TP decode engine therefore admits only requests with
+  `max_new_tokens <= 4096` (declared explicitly; an undeclared budget is the
+  context remainder) and finishes any other with an abort error.
+
+A prefill row reaching the attention is then an invariant violation and
+raises, not a configuration the operator can hit.
+
+`--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
+runs the vocab-shard GEMM and transposes the shards back to each rank's own
+rows (`[T_own, V]`), so sampling and logprobs downstream see the same
+full-vocab rows as a replicated head. On the decode path the row counts are
+read from the per-rank token tables (every rank's logits rows are its decode
+tokens, or the live rows a narrowing draft step reported), so the step has
+no host sync; the shapes without a table -- a prefill's one row per request
+or its logprob rows, a MIXED round, a model selecting its own logits rows --
+exchange the counts. A drafter sharing the target's head must build its own
+head on the same layout (the NextN, Eagle3-MLA and Llama-Eagle3 drafters do;
+the others are refused with a clear error). It cannot combine with
+`--dp-sampling`, and a request asking for prompt logprobs
+(`logprob_start_len`) is refused at admission: that path pushes the prompt
+rows through the LM head in per-request chunks, a per-rank number of row
+exchanges the group cannot agree on.
+
+`--tp-batch-invariant` replaces the two reduce-scatters of these layouts
+(after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on
+hidden: the reduction dimension (heads, intermediate channels) is
+all-gathered, every rank computes its hidden shard of every token with full
+K, and an all-to-all returns the rows. Every collective is then a pure
+permutation of bytes, so the result is bitwise the full-K GEMM a TP1 or
+replicated layer computes -- the point when a prefill engine with such a
+layer must agree with the decode engine. It moves about the bytes of the
+reduce-scatter it replaces and needs unquantized `o_proj` / `down_proj`;
+`attn` requires head TP and `attn+dense` also requires dense TP.
+
+The decode preset for a 128-way DP MLA model is thus one node-local group
+of 8 reused three times:
+
+```bash
+tokenspeed serve <model> \
+  --world-size 128 --nprocs-per-node 8 --attn-tp-size 1 --data-parallel-size 128 \
+  --attn-head-tp-size 8 --dense-tp-size 8 --lm-head-tp-size 8 \
+  --tp-batch-invariant attn+dense --disaggregation-mode decode ...
+```
+
+`--tp-batch-invariant attn+dense` needs the checkpoint's `o_proj` and dense
+`down_proj` in the loading dtype. A quantized checkpoint qualifies only when
+its `disable_quant_module` keeps those modules unquantized (`self_attn` for
+`o_proj`; `dense_mlp`, or `mlps` for LongCat, for `down_proj`); the check
+runs against the checkpoint's resolved quantization, not only
+`--quantization`, and the layers check their own weights once built. Without
+such an exclusion drop `--tp-batch-invariant` (the ordered-fold
+reduce-scatter remains batch-invariant, see `docs/design/numerics.md`).
+
 ### Pinning a request to an attention-DP rank
 
 Each attention-DP rank owns a private prefix cache, so multi-turn requests

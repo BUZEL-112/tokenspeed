@@ -82,6 +82,7 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import (
+    RETRACTION_SAFE_STEPS,
     UNBOUNDED_CACHED_PREFIX_TOKENS,
     make_spec,
 )
@@ -321,6 +322,20 @@ class RequestHandler:
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
+        # Head TP serves decode rows only, so this engine cannot run the local
+        # recovery prefill a capacity retraction would need; it admits only
+        # requests the scheduler never retracts (generation budget within one
+        # safe-step window, docs/design/scheduler.md section 4).
+        self.max_new_tokens_budget: int | None = (
+            RETRACTION_SAFE_STEPS if mapping.attn.has_head_tp else None
+        )
+        # LM-head TP under attention DP exchanges the logits rows with the
+        # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the
+        # prompt-logprob chunk loop would run that exchange a per-rank number
+        # of times, so this engine refuses requests asking for prompt logprobs.
+        self.supports_input_logprobs: bool = not (
+            mapping.attn.has_dp and mapping.lm_head.has_tp
+        )
         self.vocab_size = vocab_size
         self.clear_cache_fn = clear_cache_fn
         self.can_clear_cache_fn = can_clear_cache_fn
@@ -839,15 +854,8 @@ class RequestHandler:
                 ),
             )
 
-        req_state.sampling_params.max_new_tokens = min(
-            (
-                req_state.sampling_params.max_new_tokens
-                if req_state.sampling_params.max_new_tokens is not None
-                else 1 << 30
-            ),
-            self.max_req_len - len(req_state.prompt_input_ids) - 1,
-        )
-        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        self._refuse_unsupported_input_logprobs(req_state)
+        self._apply_generation_budget(req_spec, req_state)
         return (
             req_spec,
             req_state,
@@ -857,6 +865,39 @@ class RequestHandler:
                 recv_req.bootstrap_room,
             ),
         )
+
+    def _refuse_unsupported_input_logprobs(self, req_state) -> None:
+        """Finish a request asking for prompt logprobs with an abort when this
+        engine's LM-head layout cannot compute them (``supports_input_logprobs``)."""
+        if req_state.wants_input_logprobs and not self.supports_input_logprobs:
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: prompt logprobs (logprob_start_len) are not "
+                "available with --lm-head-tp-size > 1 under attention DP"
+            )
+
+    def _apply_generation_budget(self, req_spec, req_state) -> None:
+        """Clamp ``max_new_tokens`` to the context; refuse what exceeds this
+        engine's per-request budget (``max_new_tokens_budget``), finishing the
+        request with an abort instead of admitting work the engine cannot
+        complete."""
+        req_state.sampling_params.max_new_tokens = min(
+            (
+                req_state.sampling_params.max_new_tokens
+                if req_state.sampling_params.max_new_tokens is not None
+                else 1 << 30
+            ),
+            self.max_req_len - len(req_state.prompt_input_ids) - 1,
+        )
+        req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
+        if (
+            self.max_new_tokens_budget is not None
+            and req_spec.max_new_tokens > self.max_new_tokens_budget
+        ):
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: this decode engine (--attn-head-tp-size) serves "
+                f"at most {self.max_new_tokens_budget} new tokens per request; "
+                f"got max_new_tokens={req_spec.max_new_tokens}"
+            )
 
     # ------------------------------------------------------------------
     # Profiling: torch / cuda / viztracer / mem-snapshot / proton, driven

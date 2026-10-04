@@ -76,57 +76,15 @@ class DeepseekV3DraftDecoderLayer(DeepseekV3DecoderLayer):
     def attention_cls(self) -> type[nn.Module]:
         return DeepseekV3DraftAttentionMLA
 
-    def _maybe_narrow_residual(
+    def narrow_residual(
         self,
         residual: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
         """Narrow residual to the draft attention's [bs, H] live rows."""
-        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
+        if ctx.draft_narrowing is None:
             return residual
         return residual.index_select(0, ctx.gather_ids)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        residual: torch.Tensor | None,
-    ) -> torch.Tensor:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-            residual = self._maybe_narrow_residual(residual, ctx)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        else:
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-        return hidden_states, residual
 
 
 class DeepseekModelNextN(nn.Module):
@@ -263,7 +221,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             config, mapping=self.mapping, quant_config=quant_config
         )
 
-        if self.mapping.attn.has_dp:
+        # The draft shares the target's LM-head layout (mapping.lm_head):
+        # replicated under attention DP unless --lm-head-tp-size shards it.
+        if self.mapping.attn.has_dp and not self.mapping.lm_head.has_tp:
             self.lm_head = ReplicatedLinear(
                 config.hidden_size,
                 config.vocab_size,
@@ -274,17 +234,18 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
-                tp_rank=self.mapping.attn.tp_rank,
-                tp_size=self.mapping.attn.tp_size,
-                tp_group=self.mapping.attn.tp_group,
+                tp_rank=self.mapping.lm_head.tp_rank,
+                tp_size=self.mapping.lm_head.tp_size,
+                tp_group=self.mapping.lm_head.tp_group,
             )
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             do_argmax=True,
-            tp_rank=self.mapping.attn.tp_rank,
-            tp_size=self.mapping.attn.tp_size,
-            tp_group=self.mapping.attn.tp_group,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
     @torch.no_grad()

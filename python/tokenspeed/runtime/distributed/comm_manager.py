@@ -24,10 +24,11 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
+    all_to_all_transpose,
     token_all_gather,
     token_reduce_scatter,
 )
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import Group, Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 
 
@@ -101,8 +102,56 @@ def moe_input_row_segments(
     return [(padded, live)]
 
 
+def dp_group_row_counts(
+    table: list[int] | None,
+    group: Group,
+    rank: int,
+    num_rows: int,
+) -> list[int]:
+    """Per-rank row counts of ``group`` read from a world-indexed DP table.
+
+    ``num_rows`` is the rows this rank holds; the table's entry for it must
+    agree, so a layout mistake fails here instead of hanging in the
+    collective. The caller picks the table by the forward phase (input rows
+    or collective rows, see ``forward_input_row_table`` and
+    ``forward_collective_row_table``), never by matching ``num_rows``: a rank
+    with no rows of its own could not tell the tables apart, and every rank
+    of the group must pick the same one.
+    """
+    if table is None:
+        raise ValueError(
+            "DP row counts are unavailable: the forward carries no global token "
+            "table (attention DP is required)"
+        )
+    if table[rank] != num_rows:
+        raise ValueError(
+            f"rank {rank} holds {num_rows} rows but the forward's DP row table "
+            f"gives it {table[rank]}"
+        )
+    return [table[peer] for peer in group]
+
+
+def forward_input_row_table(ctx: ForwardContext) -> list[int] | None:
+    """Per-rank input rows of the forward (the token counts)."""
+    return ctx.global_num_tokens
+
+
+def forward_collective_row_table(ctx: ForwardContext) -> list[int] | None:
+    """Per-rank rows the forward's collectives size by: the sizing a model
+    reported (a drafter narrowing to its live rows), else the input rows."""
+    if ctx.collective_global_num_tokens is not None:
+        return ctx.collective_global_num_tokens
+    return ctx.global_num_tokens
+
+
 class CommManager:
-    """Manages communication patterns (all_reduce vs RSAG) for each decoder layer."""
+    """Manages communication patterns (all_reduce vs RSAG) for each decoder layer.
+
+    ``dense_batch_invariant`` selects the TP-batch-invariant dense tail: the
+    layer's ``down_proj`` is column-parallel on hidden and ``post_dense_comm``
+    transposes its ``[T_full, H / W]`` output back to this rank's rows instead
+    of reduce-scattering partial sums.
+    """
 
     def __init__(
         self,
@@ -110,6 +159,7 @@ class CommManager:
         layer_id: int,
         is_moe: bool,
         prev_is_moe: bool,
+        dense_batch_invariant: bool,
         input_layernorm: torch.nn.Module | None = None,
         post_attn_layernorm: torch.nn.Module | None = None,
     ) -> None:
@@ -129,6 +179,14 @@ class CommManager:
         # --moe-combine-order: whether the MoE leaf already combined the routed
         # output across the MoE TP-EP group (post_moe_comm).
         self.moe_combine_order: str = global_server_args_dict["moe_combine_order"]
+        if dense_batch_invariant and (
+            not mapping.dense.has_tp or self.use_all_reduce(is_moe=False)
+        ):
+            raise ValueError(
+                "the batch-invariant dense tail replaces a token reduce-scatter "
+                "and needs a dense TP group wider than attention TP"
+            )
+        self.dense_batch_invariant = dense_batch_invariant
 
     # ---- Scattered token counts ----
 
@@ -363,6 +421,16 @@ class CommManager:
 
         if self.use_all_reduce(is_moe=False):
             hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
+            return hidden_states, residual
+        if self.dense_batch_invariant:
+            # The column-parallel down_proj already reduced the whole
+            # intermediate dim on each rank: [T_full, H / W] holds every
+            # token's hidden shard, so only the rows move -- no sum.
+            hidden_states = all_to_all_transpose(
+                hidden_states,
+                group=self.mapping.dense.tp_group,
+                input_split_sizes=self.dense_tp_group_scattered_num_tokens(ctx),
+            )
             return hidden_states, residual
         hidden_states = token_reduce_scatter(
             hidden_states,

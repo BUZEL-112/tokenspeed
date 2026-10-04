@@ -44,7 +44,13 @@ from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     MEGATRON_VOCAB_BLOCK,
 )
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.distributed.comm_manager import dp_group_row_counts
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    all_gather_single,
+    all_to_all_transpose,
+    token_all_gather,
+)
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -170,6 +176,11 @@ class LogitsMetadata:
     # Prompt rows whose next-token logprob the forward returns (SGLang
     # ``logprob_start_len``); None when none is wanted.
     input_logprob_rows: InputLogprobRows | None = None
+    # The forward's per-rank row tables (attention DP), for the LM-head TP
+    # group's row counts; see LogitsProcessor._lm_head_tp_row_counts.
+    all_decode_or_idle: bool = False
+    global_num_tokens: list[int] | None = None
+    collective_global_num_tokens: list[int] | None = None
 
     # DP attention metadata. Not needed when DP attention is not used.
     # Number of tokens in the request.
@@ -189,6 +200,9 @@ class LogitsMetadata:
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,
+            all_decode_or_idle=ctx.all_decode_or_idle,
+            global_num_tokens=ctx.global_num_tokens,
+            collective_global_num_tokens=ctx.collective_global_num_tokens,
         )
 
 
@@ -259,7 +273,18 @@ class LogitsProcessor(nn.Module):
         tp_rank: int | None = None,
         tp_size: int | None = None,
         tp_group: tuple[int, ...] | None = None,
+        *,
+        dp_lm_head_tp: bool,
     ):
+        """``tp_*`` describe the group ``lm_head`` is vocab-sharded over.
+
+        ``dp_lm_head_tp`` selects the layout where that group's ranks are
+        data-parallel for attention and hold different rows: the rows are
+        all-gathered before the logits GEMM and the vocab shards transposed
+        back to each rank's own rows afterwards (``skip_all_gather`` is then
+        required, as the plain vocab all-gather does not apply). ``False`` is
+        today's layout: every rank of the group holds the same rows.
+        """
         super().__init__()
         self.config = config
         self.skip_all_gather = skip_all_gather
@@ -297,6 +322,12 @@ class LogitsProcessor(nn.Module):
         if tp_size != 1 and tp_group is None:
             raise ValueError("tp_group is required when tp_size > 1.")
         self.tp_rank, self.tp_size, self.tp_group = tp_rank, tp_size, tp_group
+        if dp_lm_head_tp and (tp_size == 1 or not skip_all_gather):
+            raise ValueError(
+                "dp_lm_head_tp needs a vocab-sharded head (tp_size > 1) and "
+                "skip_all_gather=True"
+            )
+        self.dp_lm_head_tp = dp_lm_head_tp
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
@@ -322,8 +353,9 @@ class LogitsProcessor(nn.Module):
         can live with. A consumer that samples from the draft distribution
         (``--enable-speculative-sampling``) calls this once after construction
         and before the first forward; the ordinary vocab all-gather then runs
-        on every draft step. Under attention DP the head is replicated
-        (``skip_all_gather``) and the logits are full-vocab either way.
+        on every draft step. Under attention DP the logits are full-vocab
+        either way: the head is replicated (``skip_all_gather``), or
+        ``dp_lm_head_tp`` transposes the vocab shards back to each rank's rows.
         Returns None.
         """
         self.do_argmax = False
@@ -548,11 +580,17 @@ class LogitsProcessor(nn.Module):
                     if aux_hidden_states
                     else hidden_states
                 )
-            return LogitsProcessorOutput(
-                next_token_logits=hidden_states.new_empty(
+            if self.dp_lm_head_tp:
+                # The LM-head TP peers hold rows: join their exchange with none.
+                logits = self._get_logits(
+                    hidden_states, lm_head, logits_metadata, require_full_vocab=False
+                )
+            else:
+                logits = hidden_states.new_empty(
                     (0, self.config.vocab_size), dtype=torch.float32
-                ),
-                hidden_states=capture,
+                )
+            return LogitsProcessorOutput(
+                next_token_logits=logits, hidden_states=capture
             )
 
         # Prompt logprobs read the full [num_tokens, hidden] activations, so
@@ -671,8 +709,20 @@ class LogitsProcessor(nn.Module):
             ValueError: The model narrowed its logits rows (``hidden_states``
                 does not cover every input row), so prompt rows have no
                 activations to read.
+            RuntimeError: The head is vocab-sharded over attention-DP ranks
+                (``dp_lm_head_tp``); admission refuses such requests
+                (``RequestHandler.supports_input_logprobs``), so reaching here
+                is a routing error.
         """
         plan = logits_metadata.input_logprob_rows
+        if self.dp_lm_head_tp:
+            # Each chunk's LM-head TP exchange needs every peer, and the peers
+            # hold different numbers of prompt rows (attention DP), so their
+            # chunk loops would not line up; refuse rather than hang.
+            raise RuntimeError(
+                "prompt logprobs are not supported with --lm-head-tp-size > 1 "
+                "under attention DP"
+            )
         if logits_metadata.logits_rows_selected or (
             hidden_states.shape[0] != plan.num_input_rows
         ):
@@ -699,6 +749,39 @@ class LogitsProcessor(nn.Module):
             )
             del logits
         return out
+
+    def _lm_head_tp_row_counts(
+        self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
+    ) -> list[int]:
+        """Rows each LM-head TP rank brings to the logits GEMM.
+
+        On the decode path every rank's logits rows follow the forward's
+        host-side tables -- its decode tokens, or the live rows a narrowing
+        drafter reported (``collective_global_num_tokens``) -- so the counts
+        are read, not exchanged, and the step stays free of host syncs. The
+        other shapes have no table: a prefill keeps one row per request or the
+        logprob rows, a MIXED round mixes both, and a model selecting its own
+        rows is on its own; those exchange the counts (a device sync, off the
+        decode path). A graph capture records a uniform padded batch on every
+        rank, so its counts are uniform and no sync is recorded.
+        """
+        rows = hidden_states.shape[0]
+        if logits_metadata.all_decode_or_idle and not (
+            logits_metadata.input_logprob_rows is not None
+            or logits_metadata.logits_rows_selected
+        ):
+            table = (
+                logits_metadata.collective_global_num_tokens
+                if logits_metadata.collective_global_num_tokens is not None
+                else logits_metadata.global_num_tokens
+            )
+            return dp_group_row_counts(
+                table, self.tp_group, self.tp_group[self.tp_rank], rows
+            )
+        if hidden_states.is_cuda and torch.cuda.is_current_stream_capturing():
+            return [rows] * self.tp_size
+        counts = torch.tensor([rows], dtype=torch.int64, device=hidden_states.device)
+        return all_gather(counts, self.tp_group, dim=0).tolist()
 
     def _get_logits(
         self,
@@ -740,6 +823,17 @@ class LogitsProcessor(nn.Module):
                 hidden_states, plan
             )
 
+        lm_head_tp_row_counts: list[int] | None = None
+        if self.dp_lm_head_tp:
+            if dp_sampling:
+                raise RuntimeError("dp_lm_head_tp cannot combine with DP sampling")
+            lm_head_tp_row_counts = self._lm_head_tp_row_counts(
+                hidden_states, logits_metadata
+            )
+            hidden_states = token_all_gather(
+                hidden_states, self.tp_group, lm_head_tp_row_counts
+            )
+
         quant_method = getattr(lm_head, "quant_method", None)
         if should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
@@ -771,7 +865,13 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
-        if dp_sampling and not self.skip_all_gather:
+        if lm_head_tp_row_counts is not None:
+            # [T_full, V / W] -> [T_own, V]: this rank's rows with every
+            # rank's vocab shard, in rank order like the plain all-gather.
+            logits = all_to_all_transpose(
+                logits, self.tp_group, input_split_sizes=lm_head_tp_row_counts
+            )
+        elif dp_sampling and not self.skip_all_gather:
             if self._logits_layout_executor is None:
                 raise RuntimeError(
                     "dp_sampling logits layout executor is not configured"

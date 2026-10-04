@@ -579,6 +579,11 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             if "mlps" in getattr(config, "disable_quant_module", [])
             else quant_config
         )
+        # --tp-batch-invariant attn+dense: column-parallel down_proj and a
+        # transposing dense tail (no cross-rank sum outside MoE).
+        dense_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
+        )
         self.mlps = nn.ModuleList(
             [
                 _DeepseekV3MLP(
@@ -589,6 +594,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                     quant_config=dense_quant_config,
                     prefix=add_prefix(f"mlps.{branch_id}", prefix),
                     is_shared_expert=False,
+                    batch_invariant=dense_batch_invariant,
                 )
                 for branch_id in range(2)
             ]
@@ -621,6 +627,12 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             layer_id=self.layer_id,
             is_moe=True,
             prev_is_moe=False,
+            dense_batch_invariant=False,
+        )
+        # --tp-batch-invariant attn+dense: the dense tail transposes rows
+        # instead of reduce-scattering channel partials (see the MLPs).
+        dense_batch_invariant = (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
         )
         self.branch_comm = [
             _CommManager(
@@ -630,6 +642,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
                 prev_is_moe=False,
                 input_layernorm=self.input_layernorm[branch_id],
                 post_attn_layernorm=self.post_attention_layernorm[branch_id],
+                dense_batch_invariant=dense_batch_invariant,
             )
             for branch_id in range(2)
         ]
@@ -710,18 +723,28 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
     def _forward_idle(
         self,
+        positions: torch.Tensor,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: _ForwardContext,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """An idle attention-DP rank joins every MLP collective over no rows.
+        """An idle attention-DP rank joins every collective over no rows, in
+        the active ranks' order.
 
         The MoE TP-EP group always spans the DP groups; the dense TP group
         does too when the dense TP is wider than the attention TP, so both
-        dense branches run as well, in the active ranks' order.
+        dense branches run as well. Each attention runs in its place and
+        decides for itself whether its layout has collectives to join (head
+        TP does; a no-op otherwise).
         """
+        self.self_attn[0](
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.branch_comm[0],
+        )
         hidden_states, residual = self._forward_moe(
             hidden_states,
             residual,
@@ -729,10 +752,18 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
             num_global_tokens,
             max_num_tokens_per_gpu,
         )
-        for branch_id in range(2):
-            hidden_states, residual = self._forward_dense_mlp(
-                branch_id, hidden_states, residual, ctx
-            )
+        hidden_states, residual = self._forward_dense_mlp(
+            0, hidden_states, residual, ctx
+        )
+        self.self_attn[1](
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.branch_comm[1],
+        )
+        hidden_states, residual = self._forward_dense_mlp(
+            1, hidden_states, residual, ctx
+        )
         return hidden_states, residual
 
     def forward(
@@ -746,6 +777,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
 
         if ctx.forward_mode.is_idle():
             return self._forward_idle(
+                positions,
                 hidden_states,
                 residual,
                 ctx,
