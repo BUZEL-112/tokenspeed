@@ -82,6 +82,10 @@ from tokenspeed.runtime.engine.request_types import FINISH_ABORT
 from tokenspeed.runtime.engine.scheduler_utils import make_spec
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.grammar.grammar_manager import GrammarManager
+from tokenspeed.runtime.moe.expert_location import (
+    EXPERT_LOAD_RECORD_SUFFIX,
+    expert_load_recording_enabled,
+)
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.base.bootstrap import BootstrapInfo
 from tokenspeed.runtime.utils import PipelinedPyobjBroadcaster
@@ -797,6 +801,18 @@ class RequestHandler:
                     "process (e.g. via TOKENSPEED_KERNEL_PROFILE); it cannot "
                     "be controlled through /start_profile.",
                 )
+        if "EXPERT_LOAD" in activities:
+            if self._device is None:
+                return ProfileReqOutput(
+                    success=False,
+                    message="EXPERT_LOAD needs the device handle.",
+                )
+            if not expert_load_recording_enabled():
+                return ProfileReqOutput(
+                    success=False,
+                    message="EXPERT_LOAD needs the routing load counters; start "
+                    "the server with --expert-distribution-recorder-mode stat.",
+                )
 
         self.profile_by_stage = profile_by_stage
         self.profiler_output_dir = output_dir
@@ -857,6 +873,10 @@ class RequestHandler:
 
         if "CUDA_PROFILER" in activities:
             torch.cuda.cudart().cudaProfilerStart()
+
+        if "EXPERT_LOAD" in activities:
+            # Routing counts every route; the window starts from zero.
+            self._device.reset_expert_load()
 
         if "PROTON" in activities:
             Path(self.profiler_output_dir).mkdir(parents=True, exist_ok=True)
@@ -959,6 +979,21 @@ class RequestHandler:
 
         if "CUDA_PROFILER" in self.profiler_activities:
             torch.cuda.cudart().cudaProfilerStop()
+
+        if "EXPERT_LOAD" in self.profiler_activities:
+            # Per-rank, unreduced (a collective here would wait on DP peers);
+            # the ranks' records are summed when the directory is consumed.
+            record_path = os.path.join(
+                self.profiler_output_dir,
+                f"{self.profile_id}-{self.profile_rank_tag}{stage_suffix}"
+                f"{EXPERT_LOAD_RECORD_SUFFIX}",
+            )
+            record = self._device.dump_expert_load(record_path)
+            logger.info(
+                f"Expert load: {int(record['physical_count'].sum())} routes counted "
+                f"on EP rank {record['ep_rank']} written to {record_path}; pass the "
+                "directory to --init-expert-location to merge every rank's record"
+            )
 
         proton_error: Exception | None = None
         if "PROTON" in self.profiler_activities:

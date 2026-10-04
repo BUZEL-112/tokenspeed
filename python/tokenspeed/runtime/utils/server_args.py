@@ -36,6 +36,10 @@ from tokenspeed.runtime.configs.numerics import (
     RL_BITWISE_SAMPLING_BACKENDS,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    EP_DISPATCH_ALGORITHMS,
+    STATIC_EP_DISPATCH_ALGORITHMS,
+)
 from tokenspeed.runtime.utils import (
     get_amdgpu_memory_capacity,
     get_colorful_logger,
@@ -91,6 +95,20 @@ _SPEC_OVERSHOOT_SPANS = 3
 # carries them through the stage boundary. See
 # ServerArgs.resolve_disaggregation.
 PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
+
+
+def expert_placement_requested(server_args) -> bool:
+    """Whether serving needs an expert placement beyond the trivial identity.
+
+    Redundant experts, a non-trivial initial location and load recording all
+    need the placement tables (``moe/expert_location.py``); plain EP serving
+    does not and keeps its routing untouched.
+    """
+    return (
+        server_args.ep_num_redundant_experts > 0
+        or server_args.init_expert_location != "trivial"
+        or server_args.expert_distribution_recorder_mode is not None
+    )
 
 
 def str_to_bool(value: str | bool) -> bool:
@@ -1300,6 +1318,63 @@ class ServerArgs:
                     "than 1024"
                 )
 
+    def validate_expert_placement_options(self):
+        """Check the expert placement flags (redundant experts, recorded load).
+
+        Experts are placed once at startup; runtime rebalancing
+        (``--enable-eplb``) is not implemented. A placement needs an explicit
+        dispatch algorithm, and under rl-bitwise a deterministic one: the
+        replicated-input EP path relies on every rank choosing the same
+        replica for a route.
+        """
+        if self.enable_eplb:
+            raise ValueError(
+                "--enable-eplb (runtime expert rebalancing) is not supported. "
+                "Record expert load with --expert-distribution-recorder-mode stat "
+                "and the EXPERT_LOAD profile activity, then serve a static "
+                "placement with --ep-num-redundant-experts and "
+                "--init-expert-location <load.pt>."
+            )
+        if self.expert_distribution_recorder_mode not in (None, "stat"):
+            raise ValueError(
+                "--expert-distribution-recorder-mode supports only 'stat' (per "
+                "physical expert route counters dumped by the EXPERT_LOAD profile "
+                f"activity), got {self.expert_distribution_recorder_mode!r}."
+            )
+        if self.ep_num_redundant_experts < 0:
+            raise ValueError("--ep-num-redundant-experts must be non-negative")
+        if self.ep_num_redundant_experts > 0 and self.mapping.moe.ep_size <= 1:
+            raise ValueError(
+                f"--ep-num-redundant-experts {self.ep_num_redundant_experts} "
+                "replicates experts across expert-parallel ranks, but the MoE "
+                f"layers run with ep_size={self.mapping.moe.ep_size}; enable "
+                "expert parallelism (--ep-size > 1) or drop the redundant experts."
+            )
+        if expert_placement_requested(self):
+            if self.ep_dispatch_algorithm is None:
+                raise ValueError(
+                    "--ep-dispatch-algorithm is required with "
+                    "--ep-num-redundant-experts, a non-trivial "
+                    "--init-expert-location or --expert-distribution-recorder-mode: "
+                    "static_with_zero_expert for models with zero experts, "
+                    "static otherwise."
+                )
+            if (
+                self.numerics == "rl-bitwise"
+                and self.ep_dispatch_algorithm not in STATIC_EP_DISPATCH_ALGORITHMS
+            ):
+                raise ValueError(
+                    "--numerics rl-bitwise needs a deterministic expert placement; "
+                    f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} picks "
+                    "replicas at random. Use static or static_with_zero_expert."
+                )
+        elif self.ep_dispatch_algorithm is not None:
+            raise ValueError(
+                f"--ep-dispatch-algorithm {self.ep_dispatch_algorithm} has no effect "
+                "without an expert placement (--ep-num-redundant-experts, "
+                "--init-expert-location or --expert-distribution-recorder-mode)."
+            )
+
     def validate(self):
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
@@ -1333,19 +1408,7 @@ class ServerArgs:
         if self.deepseek_v4_prefill_chunk_size <= 0:
             raise ValueError("deepseek_v4_prefill_chunk_size must be positive")
 
-        if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
-            self.expert_distribution_recorder_mode = "stat"
-            logger.info(
-                "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
-            )
-
-        if (self.enable_eplb or (self.init_expert_location is not None)) and (
-            self.ep_dispatch_algorithm is None
-        ):
-            self.ep_dispatch_algorithm = "static"
-            logger.info(
-                "EPLB is enabled or init_expert_location is provided. ep_dispatch_algorithm is configured."
-            )
+        self.validate_expert_placement_options()
 
         from tokenspeed.runtime.utils.env import envs
 
@@ -1841,31 +1904,41 @@ class ServerArgs:
             "--init-expert-location",
             type=str,
             default=ServerArgs.init_expert_location,
-            help="Initial location of EP experts.",
+            help="Expert placement: 'trivial', or a .pt/.json file (or inline "
+            "JSON) holding a 'logical_count' [layers, experts] load record to "
+            "derive the placement from with the EPLB algorithm, or a "
+            "'physical_to_logical_map' [layers, slots] to pin it exactly. "
+            "The EXPERT_LOAD profile activity writes such a load record.",
         )
         parser.add_argument(
             "--ep-num-redundant-experts",
             type=int,
             default=ServerArgs.ep_num_redundant_experts,
-            help="Allocate this number of redundant experts in expert parallel.",
+            help="Add this many physical expert slots per MoE layer for replicas "
+            "of hot experts; the total must divide over the EP size.",
         )
         parser.add_argument(
             "--ep-dispatch-algorithm",
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
-            help="The algorithm to choose ranks for redundant experts in expert parallel.",
+            choices=list(EP_DISPATCH_ALGORITHMS),
+            help="How routing picks among an expert's replicas; required with an "
+            "expert placement. static_with_zero_expert for models with zero "
+            "experts (LongCat), static otherwise; dynamic* draw at random.",
         )
         parser.add_argument(
             "--eplb-algorithm",
             type=str,
             default=ServerArgs.eplb_algorithm,
-            help="Chosen EPLB algorithm",
+            help="EPLB algorithm deriving the placement from a load record: "
+            "auto, deepseek or deepseek_hierarchical.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-mode",
             type=str,
             default=ServerArgs.expert_distribution_recorder_mode,
-            help="Mode of expert distribution recorder.",
+            help="'stat' counts the routes to every physical expert so the "
+            "EXPERT_LOAD profile activity can dump a load record.",
         )
         parser.add_argument(
             "--expert-distribution-recorder-buffer-size",
@@ -1881,7 +1954,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-eplb",
             action="store_true",
-            help="Enable EPLB algorithm",
+            help="Runtime expert rebalancing; not supported (rejected at startup). "
+            "Use a static placement from a recorded load instead.",
         )
         parser.add_argument(
             "--dense-gemm-backend",

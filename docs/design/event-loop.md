@@ -96,6 +96,16 @@ Consequences:
   probes, prefetch planning/results, failed-read invalidation, namespace and
   weight-version changes, and cache shutdown. These keep the executor and
   Host buffer hidden; they do not introduce another generic work slot.
+  The `EXPERT_LOAD` profile activity adds two more named operations,
+  `reset_expert_load` and `dump_expert_load`: the routing kernels bump the
+  expert placement's load counters on the execution stream, so zeroing and
+  reading them back ride the forward thread on that stream (the read-back is
+  a deliberate, low-rate host wait, like the other `run_*` methods). The
+  dump is rank-local by contract -- it runs no collective. A profile stop
+  reaches attention-DP workers independently (`stop_profile` is delivered
+  per DP worker), so a rank reducing inside the request would block in the
+  collective while its peer is still in `_dp_sync_and_check`; the ranks'
+  records are summed where they are consumed (`--init-expert-location`).
   Changing this surface requires updating both this contract and the explicit
   operation allowlist in `test/runtime/test_device_handle.py`.
 * The role is a **value** (`DeviceRole`), not a class hierarchy. Subclassing

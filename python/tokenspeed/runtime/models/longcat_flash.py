@@ -49,6 +49,9 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader as _build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer as _MoELayer
+from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo as _ExpertLocationDispatchInfo,
+)
 from tokenspeed.runtime.layers.moe.topk import TopK as _TopK
 from tokenspeed.runtime.layers.moe.topk import TopKOutputFormat as _TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType as _RoutingMethodType
@@ -77,11 +80,20 @@ from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3MLP as _DeepseekV3ML
 from tokenspeed.runtime.models.deepseek_v3 import (
     _prepare_mla_kv_b_proj_weights,
 )
+from tokenspeed.runtime.moe.dispatch_algorithm import (
+    has_zero_expert as _has_zero_expert,
+)
 from tokenspeed.runtime.moe.distribution_recorder import (
     get_global_expert_distribution_recorder as _get_global_expert_distribution_recorder,
 )
 from tokenspeed.runtime.moe.expert_location import (
+    ExpertLocationMetadata as _ExpertLocationMetadata,
+)
+from tokenspeed.runtime.moe.expert_location import (
     ModelConfigForExpertLocation as _ModelConfigForExpertLocation,
+)
+from tokenspeed.runtime.moe.expert_location import (
+    get_global_expert_location_metadata as _get_global_expert_location_metadata,
 )
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork as _StreamFork
@@ -165,6 +177,37 @@ def _get_longcat_moe_quant_config(
         f"({num_ignored}/{num_expected} expert projections). TokenSpeed requires "
         "all experts in one fused MoE layer to use the same weight format."
     )
+
+
+def _check_longcat_expert_placement(
+    placement: _ExpertLocationMetadata,
+    config: _PretrainedConfig,
+    layer_index: int,
+    mapping: _Mapping,
+) -> None:
+    """Refuse a placement whose geometry is not this model's."""
+    if placement.num_logical_experts != config.n_routed_experts:
+        raise ValueError(
+            f"expert placement has {placement.num_logical_experts} logical experts, "
+            f"LongCat routes {config.n_routed_experts}"
+        )
+    if not 0 <= layer_index < placement.num_layers:
+        raise ValueError(
+            f"LongCat MoE layer {layer_index} is outside the placement's "
+            f"{placement.num_layers} layers; the layer index must be passed"
+        )
+    if placement.ep_size != mapping.moe.ep_size:
+        raise ValueError(
+            f"expert placement spans ep_size={placement.ep_size}, the MoE mapping "
+            f"has ep_size={mapping.moe.ep_size}"
+        )
+    algorithm = global_server_args_dict["ep_dispatch_algorithm"]
+    if config.zero_expert_num > 0 and not _has_zero_expert(algorithm):
+        raise ValueError(
+            f"LongCat routes {config.zero_expert_num} zero experts; use "
+            "--ep-dispatch-algorithm static_with_zero_expert (or "
+            f"dynamic_with_zero_expert), not {algorithm}"
+        )
 
 
 class _RuntimeLongcatRouter(nn.Module):
@@ -259,11 +302,22 @@ class _RuntimeLongcatMoE(nn.Module):
             config=config,
             prefix=add_prefix("router", prefix),
         )
+        # The target's expert placement (process-global while the target is
+        # built; None for drafts and plain serving): P = E + R physical slots,
+        # the router emits physical ids and the loader fills every replica.
+        self.expert_placement: _ExpertLocationMetadata | None = (
+            _get_global_expert_location_metadata()
+        )
+        if self.expert_placement is not None:
+            _check_longcat_expert_placement(
+                self.expert_placement, config, layer_index, self.mapping
+            )
         self.experts = _MoELayer(
             top_k=config.moe_topk,
             num_experts=(
                 config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
+                if self.expert_placement is None
+                else self.expert_placement.num_physical_experts
             ),
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
@@ -274,7 +328,6 @@ class _RuntimeLongcatMoE(nn.Module):
             tp_size=self.mapping.moe.tp_size,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
-            zero_expert_type=config.zero_expert_type,
             zero_expert_num=config.zero_expert_num,
             # LongCat applies its own zero-expert routing to gated SiLU experts.
             activation="swiglu",
@@ -295,6 +348,7 @@ class _RuntimeLongcatMoE(nn.Module):
             )
         self.topk = _TopK(
             top_k=config.moe_topk,
+            layer_id=layer_index,
             renormalize=config.norm_topk_prob,
             correction_bias=self.router.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
@@ -303,6 +357,18 @@ class _RuntimeLongcatMoE(nn.Module):
             # DeepEP, the one consumer of int64 ids, is refused above.
             topk_indices_dtype=torch.int32,
         )
+        # This layer's view of the placement tables for the router; the
+        # dispatch flavour follows the MoE kernel: all-to-all EP routes each
+        # rank's own tokens to its nearest replica, replicated-input EP routes
+        # every token on every rank and needs a rank-agnostic replica choice.
+        self.expert_dispatch_info: _ExpertLocationDispatchInfo | None = None
+        if self.expert_placement is not None:
+            self.expert_dispatch_info = _ExpertLocationDispatchInfo.init_new(
+                layer_id=layer_index,
+                ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                expert_location_metadata=self.expert_placement,
+                all_to_all_ep=self.experts.supports_all_to_all_ep,
+            )
 
     def get_moe_routed_weights(self):
         return [
@@ -323,9 +389,17 @@ class _RuntimeLongcatMoE(nn.Module):
         if self.zero_expert_num <= 0:
             return None
 
-        zero_expert_mask = (topk_output.topk_ids < 0) | (
-            topk_output.topk_ids >= self.n_routed_experts
+        # The router's contract: a zero expert is -1, every other id is a
+        # physical slot in [0, P) (the routed experts, plus the replicas an
+        # expert placement adds past E). Nothing here depends on whether a
+        # placement is active; the bound is checked device-side, graph-safe.
+        topk_ids = topk_output.topk_ids
+        torch._assert_async(
+            (topk_ids < self.experts.num_experts).all(),
+            f"LongCat top-k id at or beyond the {self.experts.num_experts} "
+            "physical experts; zero experts must be -1",
         )
+        zero_expert_mask = topk_ids < 0
         zero_expert_weights = torch.where(
             zero_expert_mask,
             topk_output.topk_weights,
@@ -358,7 +432,11 @@ class _RuntimeLongcatMoE(nn.Module):
         with self.stream_fork.scope(enable=_get_is_capture_mode()):
             router_logits = self.router(hidden_states)
             if hidden_states.shape[0] > 0:
-                topk_output = self.topk(hidden_states, router_logits)
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=self.expert_dispatch_info,
+                )
             else:
                 topk_output = self.topk.empty_topk_output(
                     hidden_states.device,
@@ -779,6 +857,9 @@ class _RuntimeLongcatModel(nn.Module):
 
 class LongcatFlashForCausalLM(_BaseCausalLM):
     model_cls = _RuntimeLongcatModel
+    # The MoE layers size their slots from the placement and route through
+    # its tables; load_weights fills every placed replica.
+    supports_expert_placement = True
 
     def __init__(
         self,
@@ -829,6 +910,14 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    @property
+    def expert_placement(self) -> _ExpertLocationMetadata | None:
+        """The placement the MoE layers were built with; None routes trivially."""
+        for layer in self.model.layers:
+            if isinstance(layer.mlp, _RuntimeLongcatMoE):
+                return layer.mlp.expert_placement
+        return None
+
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
@@ -863,6 +952,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         ]
         fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
         params_dict = dict(self.named_parameters())
+        # The placement the MoE layers were built with: every local slot is
+        # filled from the logical expert it holds (replicas included), and RL
+        # weight sync through this same path lands in every replica.
+        expert_placement = self.expert_placement
         # ``get_param`` remaps checkpoint names; report the parameter's own.
         param_names = {id(param): name for name, param in params_dict.items()}
         loaded: set[str] = set()
@@ -873,9 +966,14 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                 down_proj_name="down_proj",
                 up_proj_name="up_proj",
             ),
-            num_experts=self.config.n_routed_experts,
+            num_experts=(
+                self.config.n_routed_experts
+                if expert_placement is None
+                else expert_placement.num_physical_experts
+            ),
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
+            expert_placement=expert_placement,
         )
 
         for name, loaded_weight in weights:

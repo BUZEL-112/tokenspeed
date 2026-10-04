@@ -25,7 +25,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -121,6 +121,12 @@ class BaseCausalLM(nn.Module):
     """
 
     model_cls: type[BaseTransformerModel]
+    # Whether the model's MoE layers route through the process-global expert
+    # placement (redundant replicas, load counters; ``moe/expert_location.py``)
+    # and its loader fills every placed slot. ``build_expert_placement``
+    # refuses the placement flags for a model that does not, so a placement
+    # is never installed only to be ignored.
+    supports_expert_placement: ClassVar[bool] = False
 
     # Live weight-update session (see the class docstring). Declared here
     # with defaults and assigned again in ``__init__``.
