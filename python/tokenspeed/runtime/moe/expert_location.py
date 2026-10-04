@@ -42,6 +42,12 @@ Load records are per rank and never reduced on the serving path (a collective
 there would deadlock attention-DP workers that stop a profile independently):
 each rank writes its own counters, and ``merge_expert_load_records`` sums the
 ranks' files when the record is consumed.
+
+The tables are mutable in place (``update_layers``): the router and the
+captured CUDA graphs hold views of them, so an online rebalance rewrites rows
+in their existing storage and never reallocates. The replica table therefore
+keeps a fixed width, ``R + 1`` (the most replicas one expert can have), rather
+than the widest count of the current placement.
 """
 
 from __future__ import annotations
@@ -53,12 +59,20 @@ import random
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import torch
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.model_loader import get_model_architecture
 from tokenspeed.runtime.moe import eplb_algorithms
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.moe.placement_maps import (
+    compute_placement_maps,
+    pad_replica_table,
+    replica_table_width,
+)
 from tokenspeed.runtime.utils.server_args import (
     ServerArgs,
     expert_placement_requested,
@@ -66,15 +80,24 @@ from tokenspeed.runtime.utils.server_args import (
 
 __all__ = [
     "EXPERT_LOAD_RECORD_SUFFIX",
+    "ExpertLoadSnapshot",
     "ExpertLocationMetadata",
+    "InitExpertLocationForm",
     "ModelConfigForExpertLocation",
+    "PreparedPlacementRows",
     "build_expert_placement",
     "compute_initial_expert_location_metadata",
     "compute_logical_to_rank_dispatch_physical_map",
+    "compute_placement_maps",
     "expert_load_recording_enabled",
     "expert_placement_requested",
     "get_global_expert_location_metadata",
+    "init_expert_location_form",
+    "load_balancedness",
+    "logical_count_of",
     "merge_expert_load_records",
+    "pad_replica_table",
+    "replica_table_width",
     "set_global_expert_location_metadata",
 ]
 
@@ -83,6 +106,49 @@ logger = logging.getLogger(__name__)
 # File suffix of the per-rank load record the EXPERT_LOAD profile activity
 # writes; a directory given to --init-expert-location is scanned for it.
 EXPERT_LOAD_RECORD_SUFFIX = ".expert-load.pt"
+
+
+@dataclass(frozen=True)
+class ExpertLoadSnapshot:
+    """One rank's route counters since the previous snapshot, on the host.
+
+    Attributes:
+        physical_count: ``[layers, physical]`` int64 routes per slot.
+        physical_to_logical_map: The placement those routes were counted
+            under, so the logical load is derived from the matching rows even
+            if the tables move afterwards.
+    """
+
+    physical_count: torch.Tensor
+    physical_to_logical_map: torch.Tensor
+
+    @property
+    def logical_count(self) -> torch.Tensor:
+        return logical_count_of(
+            self.physical_count,
+            self.physical_to_logical_map,
+            int(self.physical_to_logical_map.max().item()) + 1,
+        )
+
+
+@dataclass(frozen=True)
+class PreparedPlacementRows:
+    """Host-side rows of one chunk's table switch (``prepare_layers``).
+
+    Attributes:
+        layer_ids: The chunk's layers, in switch order.
+        physical_to_logical: ``[n, P]`` int64 logical id per slot.
+        replicas: ``[n, E, X]`` int32 replica table rows, -1 padded.
+        num_valid: ``[n, E]`` int32 replicas per logical expert.
+        rank_dispatch: ``[n, E]`` int32 rows of this rank's static dispatch
+            map, or None when the placement never materialized it.
+    """
+
+    layer_ids: tuple[int, ...]
+    physical_to_logical: torch.Tensor
+    replicas: torch.Tensor
+    num_valid: torch.Tensor
+    rank_dispatch: torch.Tensor | None
 
 
 @dataclass
@@ -96,8 +162,9 @@ class ExpertLocationMetadata:
     physical_to_logical_map: torch.Tensor  # (layers, num_physical_experts)
     physical_to_logical_map_cpu: torch.Tensor
     # (layers, num_logical_experts, X) int32: the replicas of every logical
-    # expert, -1 padded to the widest replica count X. This is the one routing
-    # table; the router indexes a per-layer slice of it.
+    # expert, -1 padded to the fixed width X = R + 1 (``replica_table_width``).
+    # This is the one routing table; the router indexes a per-layer slice of
+    # it, and ``update_layers`` rewrites rows in place.
     logical_to_all_physical_map: torch.Tensor
     # (layers, num_logical_experts) int32 valid entries per row, all >= 1.
     logical_to_all_physical_map_num_valid: torch.Tensor
@@ -110,6 +177,9 @@ class ExpertLocationMetadata:
     # (layers, num_physical_experts) int64 routes to each physical expert
     # since the last reset; None until load recording is enabled.
     physical_load: torch.Tensor | None = field(init=False, default=None)
+    # Which rows of the MoE input are real tokens (padded forwards carry
+    # filler rows the counters must not see); enabled with the counters.
+    load_rows: ExpertLoadRowMask | None = field(init=False, default=None)
     # This rank's static dispatch map (layers, num_logical_experts), computed
     # on first use: only all-to-all EP under a static algorithm needs it.
     _rank_dispatch_map: torch.Tensor | None = field(
@@ -167,15 +237,137 @@ class ExpertLocationMetadata:
         num_valid = self.logical_to_all_physical_map_num_valid
         if int(num_valid.min().item()) < 1:
             raise ValueError("every logical expert needs at least one physical slot")
-        # One routing table, trimmed to the widest replica count so the router
-        # indexes a small [logical, X] slice; never padded to P columns.
-        widest = int(num_valid.max().item())
-        self.logical_to_all_physical_map = (
-            self.logical_to_all_physical_map[..., :widest].to(torch.int32).contiguous()
+        # One routing table at the fixed width R + 1 (never P columns): the
+        # router indexes a small [logical, X] slice, and an online rebalance
+        # rewrites rows in place, so the width cannot follow the placement.
+        self.logical_to_all_physical_map = pad_replica_table(
+            self.logical_to_all_physical_map,
+            replica_table_width(num_physical_experts, num_logical_experts_0),
         )
         self.logical_to_all_physical_map_num_valid = num_valid.to(
             torch.int32
         ).contiguous()
+
+    # -------------------------------- in-place updates ------------------------------
+
+    def prepare_layers(
+        self, layer_ids: Sequence[int], new_rows: torch.Tensor
+    ) -> PreparedPlacementRows:
+        """Derive, on the host, everything a table switch of ``layer_ids`` writes.
+
+        One call per chunk: the inverse (replica) rows, their valid counts and
+        -- when this rank's static dispatch map has been materialized -- its
+        rows for exactly these layers. Validation (every logical expert keeps
+        a slot) happens here, before any table is touched, so the per-layer
+        ``switch_layer`` is a few ``copy_`` calls and the forward thread's
+        stall is bounded by the chunk, not by the model.
+
+        Args:
+            layer_ids: The layers to switch.
+            new_rows: ``[len(layer_ids), num_physical_experts]`` logical ids
+                on the host, one row per layer.
+        """
+        layer_ids = tuple(int(layer_id) for layer_id in layer_ids)
+        new_rows = new_rows.to(device="cpu", dtype=torch.int64)
+        if tuple(new_rows.shape) != (len(layer_ids), self.num_physical_experts):
+            raise ValueError(
+                f"new_rows has shape {tuple(new_rows.shape)}, expected "
+                f"({len(layer_ids)}, {self.num_physical_experts})"
+            )
+        for layer_id in layer_ids:
+            if not 0 <= layer_id < self.num_layers:
+                raise ValueError(
+                    f"layer {layer_id} is outside the placement's {self.num_layers}"
+                )
+        replicas = pad_replica_table(
+            _compute_logical_to_all_physical_map(
+                new_rows, num_logical_experts=self.num_logical_experts
+            ),
+            self.logical_to_all_physical_map.shape[-1],
+        )
+        num_valid = torch.count_nonzero(replicas != -1, dim=-1).to(torch.int32)
+        rank_dispatch = None
+        if self._rank_dispatch_map is not None:
+            # Each (layer, expert) choice depends only on that layer's
+            # replicas, so only the chunk's rows are derived; every rank runs
+            # the same computation on the same rows.
+            rank_dispatch = compute_logical_to_rank_dispatch_physical_map(
+                logical_to_all_physical_map=replicas,
+                num_physical_experts=self.num_physical_experts,
+                ep_rank_nodes=self.ep_rank_nodes,
+                ep_rank=self.ep_rank,
+            )
+        return PreparedPlacementRows(
+            layer_ids=layer_ids,
+            physical_to_logical=new_rows,
+            replicas=replicas,
+            num_valid=num_valid,
+            rank_dispatch=rank_dispatch,
+        )
+
+    def switch_layer(self, prepared: PreparedPlacementRows, index: int) -> None:
+        """Rewrite one prepared layer's rows in the existing tables.
+
+        The router and the captured CUDA graphs hold views of these tables, so
+        the switch is a ``copy_`` into their storage: the device
+        ``physical_to_logical_map`` and replica table rows, the valid counts,
+        this rank's static dispatch map when it has been materialized, then
+        the host map the loader and the move planner read. Called on the
+        forward thread only, after the layer's weights landed, so a forward
+        never sees a layer whose table and slots disagree.
+
+        Args:
+            prepared: The chunk's rows from ``prepare_layers``.
+            index: Position of the layer within ``prepared.layer_ids``.
+        """
+        layer_id = prepared.layer_ids[index]
+        device = self.physical_to_logical_map.device
+        self.physical_to_logical_map[layer_id].copy_(
+            prepared.physical_to_logical[index].to(self.physical_to_logical_map.dtype)
+        )
+        self.logical_to_all_physical_map[layer_id].copy_(
+            prepared.replicas[index].to(device)
+        )
+        self.logical_to_all_physical_map_num_valid[layer_id].copy_(
+            prepared.num_valid[index].to(device)
+        )
+        if self._rank_dispatch_map is not None:
+            if prepared.rank_dispatch is None:
+                raise RuntimeError(
+                    "the static dispatch map was materialized after the rows "
+                    "were prepared; prepare the chunk again"
+                )
+            self._rank_dispatch_map[layer_id].copy_(
+                prepared.rank_dispatch[index].to(device)
+            )
+        self.physical_to_logical_map_cpu[layer_id].copy_(
+            prepared.physical_to_logical[index].to(
+                self.physical_to_logical_map_cpu.dtype
+            )
+        )
+
+    def update_layers(self, layer_ids: Sequence[int], new_rows: torch.Tensor) -> None:
+        """Prepare and switch ``layer_ids`` in one go (``prepare_layers`` + ``switch_layer``)."""
+        prepared = self.prepare_layers(layer_ids, new_rows)
+        for index in range(len(prepared.layer_ids)):
+            self.switch_layer(prepared, index)
+
+    def snapshot_load(self) -> ExpertLoadSnapshot:
+        """Read the route counters to the host and start a new window.
+
+        Runs on the forward thread, on the execution stream the routing
+        kernels bump the counters on: the read-back (a deliberate host wait)
+        lands behind the in-flight forward and the zeroing lands before the
+        next one, so the window boundary is exact at forward granularity.
+        """
+        if self.physical_load is None:
+            raise RuntimeError("expert load recording is not enabled")
+        physical = self.physical_load.to(device="cpu", dtype=torch.int64, copy=True)
+        self.physical_load.zero_()
+        return ExpertLoadSnapshot(
+            physical_count=physical,
+            physical_to_logical_map=self.physical_to_logical_map_cpu.clone(),
+        )
 
     # -------------------------------- placement queries ------------------------------
 
@@ -217,17 +409,31 @@ class ExpertLocationMetadata:
 
     # -------------------------------- load recording ---------------------------------
 
-    def enable_load_recording(self) -> None:
+    def enable_load_recording(self, mapping: Mapping) -> None:
         """Allocate the per-physical-expert route counters the router bumps.
 
         int64: on replicated-input EP every rank counts every token's routes,
-        and a long window on a hot expert overruns int32.
+        and a long window on a hot expert overruns int32. The live-row mask
+        that keeps padded forwards' filler rows out of the counters comes
+        with them; its buffer is reserved before the first forward
+        (``reserve_load_rows``).
+
+        Args:
+            mapping: The parallel layout, which lays out the ranks' rows in
+                the MoE input.
         """
         self.physical_load = torch.zeros(
             (self.num_layers, self.num_physical_experts),
             dtype=torch.int64,
             device=self.physical_to_logical_map.device,
         )
+        self.load_rows = ExpertLoadRowMask(mapping)
+
+    def reserve_load_rows(self, max_rows: int) -> None:
+        """Reserve the live-row mask for the largest MoE input any forward carries."""
+        if self.load_rows is None:
+            raise RuntimeError("expert load recording is not enabled")
+        self.load_rows.reserve(max_rows, self.physical_to_logical_map.device)
 
     def reset_load(self) -> None:
         if self.physical_load is None:
@@ -248,7 +454,7 @@ class ExpertLocationMetadata:
         physical = physical_load.to(device="cpu", dtype=torch.int64, copy=True)
         return {
             "physical_count": physical,
-            "logical_count": _logical_count(
+            "logical_count": logical_count_of(
                 physical, self.physical_to_logical_map_cpu, self.num_logical_experts
             ),
             "physical_to_logical_map": self.physical_to_logical_map_cpu.clone(),
@@ -319,11 +525,13 @@ class ExpertLocationMetadata:
     def init_by_eplb(
         server_args: ServerArgs, model_config: ModelConfig, logical_count: torch.Tensor
     ):
+        """Startup wrapper of ``compute_placement_maps`` over a recorded load."""
         if not isinstance(logical_count, torch.Tensor):
             logical_count = torch.tensor(logical_count)
-        if len(logical_count.shape) == 2:
-            logical_count = logical_count.unsqueeze(0)
-        logical_count = logical_count.to(server_args.device)
+        if len(logical_count.shape) == 3:
+            # Several recording windows: the algorithm balances their sum.
+            logical_count = logical_count.sum(dim=0)
+        logical_count = logical_count.cpu()
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
         model_config_for_expert_location = common["model_config_for_expert_location"]
@@ -334,25 +542,23 @@ class ExpertLocationMetadata:
             model_config_for_expert_location.num_layers,
             model_config_for_expert_location.num_logical_experts,
         )
-        if tuple(logical_count.shape[-2:]) != expected:
+        if tuple(logical_count.shape) != expected:
             raise ValueError(
                 f"logical_count has shape {tuple(logical_count.shape)}; the model "
                 f"has {expected[0]} MoE layers of {expected[1]} routed experts."
             )
 
-        physical_to_logical_map, logical_to_all_physical_map, expert_count = (
-            eplb_algorithms.rebalance_experts(
-                tokens_per_expert=logical_count,
-                num_physical_experts=num_physical_experts,
-                num_local_physical_experts=num_physical_experts // common["ep_size"],
+        physical_to_logical_map, logical_to_all_physical_map = compute_placement_maps(
+            logical_count,
+            num_physical_experts=num_physical_experts,
+            ep_size=common["ep_size"],
+            num_groups=num_groups,
+            num_nodes=num_nodes,
+            algorithm=eplb_algorithms.compute_algorithm(
+                raw_algorithm=server_args.eplb_algorithm,
                 num_groups=num_groups,
                 num_nodes=num_nodes,
-                algorithm=eplb_algorithms.compute_algorithm(
-                    raw_algorithm=server_args.eplb_algorithm,
-                    num_groups=num_groups,
-                    num_nodes=num_nodes,
-                ),
-            )
+            ),
         )
 
         return ExpertLocationMetadata._init_raw(
@@ -464,7 +670,7 @@ class ExpertLocationMetadata:
         )
 
 
-def _logical_count(
+def logical_count_of(
     physical_count: torch.Tensor,
     physical_to_logical_map: torch.Tensor,
     num_logical_experts: int,
@@ -474,6 +680,17 @@ def _logical_count(
     logical = torch.zeros((num_layers, num_logical_experts), dtype=torch.int64)
     logical.scatter_add_(1, physical_to_logical_map.long(), physical_count)
     return logical
+
+
+def load_balancedness(physical_count: torch.Tensor, ep_size: int) -> torch.Tensor:
+    """Per-layer mean rank load over the busiest rank's load, from a ``[layers, physical]`` count.
+
+    1.0 is perfectly balanced; the busiest rank is the layer's critical path.
+    Slots are owned contiguously, so the rank loads are the row's chunks.
+    """
+    num_layers = physical_count.shape[0]
+    per_rank = physical_count.view(num_layers, ep_size, -1).sum(-1).double()
+    return per_rank.mean(-1) / per_rank.max(-1).values.clamp_min(1)
 
 
 def _compute_logical_to_all_physical_map(
@@ -699,7 +916,7 @@ def build_expert_placement(
         )
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
-        placement.enable_load_recording()
+        placement.enable_load_recording(server_args.mapping)
     logger.info(
         f"Expert placement: {placement.num_logical_experts} logical experts on "
         f"{placement.num_physical_experts} physical slots over "
@@ -756,11 +973,9 @@ def merge_expert_load_records(paths: Sequence[str | Path]) -> dict:
         physical_count += record["physical_count"].to(torch.int64)
         ep_ranks.append(int(record["ep_rank"]))
     num_layers = physical_to_logical_map.shape[0]
-    rank_count = physical_count.view(num_layers, ep_size, -1).sum(-1)
-    per_rank = rank_count.double()
     return {
         # Every logical expert has a slot, so the map's largest id is E - 1.
-        "logical_count": _logical_count(
+        "logical_count": logical_count_of(
             physical_count,
             physical_to_logical_map,
             int(physical_to_logical_map.max().item()) + 1,
@@ -769,36 +984,65 @@ def merge_expert_load_records(paths: Sequence[str | Path]) -> dict:
         "physical_to_logical_map": physical_to_logical_map,
         "ep_size": ep_size,
         "ep_ranks": sorted(ep_ranks),
-        "rank_count": rank_count,
-        "balancedness": per_rank.mean(-1) / per_rank.max(-1).values.clamp_min(1),
+        "rank_count": physical_count.view(num_layers, ep_size, -1).sum(-1),
+        "balancedness": load_balancedness(physical_count, ep_size),
     }
 
 
-def _expert_load_record_paths(data: str) -> list[str] | None:
-    """The record files ``--init-expert-location`` names, or None for other inputs."""
+InitExpertLocationForm = Literal["trivial", "json", "directory", "file", "glob"]
+
+
+def init_expert_location_form(data: str) -> InitExpertLocationForm:
+    """Decide what ``--init-expert-location`` names, in one fixed order.
+
+    ``trivial`` is the identity placement; a string starting with ``{`` is
+    inline JSON (a bare map or a load record); an existing directory holds
+    the per-rank ``*.expert-load.pt`` records of one profile; an existing
+    file is one ``.pt`` or ``.json`` record or map; anything else is a glob
+    over record files. Deciding by form (not by the characters a glob would
+    use) keeps inline JSON with ``[`` or ``?`` inside from being read as a
+    pattern.
+    """
+    if data == "trivial":
+        return "trivial"
+    if data.lstrip().startswith("{"):
+        return "json"
     path = Path(data)
     if path.is_dir():
-        paths = sorted(str(p) for p in path.glob(f"*{EXPERT_LOAD_RECORD_SUFFIX}"))
+        return "directory"
+    if path.is_file():
+        return "file"
+    return "glob"
+
+
+def _expert_load_record_paths(data: str, form: InitExpertLocationForm) -> list[str]:
+    """The record files a ``directory`` or ``glob`` form names (at least one)."""
+    if form == "directory":
+        paths = sorted(str(p) for p in Path(data).glob(f"*{EXPERT_LOAD_RECORD_SUFFIX}"))
         if not paths:
             raise ValueError(f"{data} holds no *{EXPERT_LOAD_RECORD_SUFFIX} records")
         return paths
-    if glob.has_magic(data):
+    if form == "glob":
         paths = sorted(glob.glob(data))
         if not paths:
-            raise ValueError(f"{data} matches no expert load record")
+            raise ValueError(
+                f"--init-expert-location {data!r} is not 'trivial', inline JSON, "
+                "a directory or a file, and matches no expert load record as a glob"
+            )
         return paths
-    return None
+    raise ValueError(f"{form} names no record files")
 
 
 def compute_initial_expert_location_metadata(
     server_args: ServerArgs, model_config: ModelConfig
 ) -> ExpertLocationMetadata:
     data = server_args.init_expert_location
-    if data == "trivial":
+    form = init_expert_location_form(data)
+    if form == "trivial":
         return ExpertLocationMetadata.init_trivial(server_args, model_config)
 
-    record_paths = _expert_load_record_paths(data)
-    if record_paths is not None:
+    if form in ("directory", "glob"):
+        record_paths = _expert_load_record_paths(data, form)
         logger.info(
             f"init_expert_location: EPLB placement from {len(record_paths)} merged "
             f"expert load records in {data}"
@@ -809,12 +1053,17 @@ def compute_initial_expert_location_metadata(
             logical_count=merge_expert_load_records(record_paths)["logical_count"],
         )
 
-    if data.endswith(".pt"):
+    if form == "json":
+        data_dict = json.loads(data)
+    elif data.endswith(".pt"):
         data_dict = torch.load(data, weights_only=True)
     elif data.endswith(".json"):
         data_dict = json.loads(Path(data).read_text())
     else:
-        data_dict = json.loads(data)
+        raise ValueError(
+            f"--init-expert-location file {data!r} must be a .pt or .json "
+            "record or placement map"
+        )
 
     # A load record (EXPERT_LOAD profile) carries both its counts and the
     # placement that produced them; the counts win, since the point of the

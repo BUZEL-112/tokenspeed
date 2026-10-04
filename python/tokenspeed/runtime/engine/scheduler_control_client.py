@@ -31,9 +31,6 @@ from typing import (
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
-    ExpertDistributionReq,
-    ExpertDistributionReqOutput,
-    ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
@@ -53,6 +50,8 @@ from tokenspeed.runtime.engine.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    RebalanceExpertsReqInput,
+    RebalanceExpertsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -103,6 +102,7 @@ def combined_weight_update_output(
         | DestroyWeightsUpdateGroupReqOutput
         | UpdateWeightsFromDistributedReqOutput
         | UpdateWeightsFromMooncakeReqOutput
+        | RebalanceExpertsReqOutput
     ],
 ) -> tuple[bool, str]:
     """AND every DP replica's weight-op reply into one frontend result.
@@ -135,6 +135,9 @@ class SchedulerControlClient:
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.update_weights_from_mooncake_communicator = _Communicator(
+            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
+        )
+        self.rebalance_experts_communicator = _Communicator(
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
         self.update_weights_from_tensor_communicator = _Communicator(
@@ -174,9 +177,6 @@ class SchedulerControlClient:
             self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
         )
 
-        self.expert_distribution_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
         self._result_dispatcher += self._get_communicator_dispatcher()
 
     def _get_communicator_dispatcher(self: AsyncLLM):
@@ -197,6 +197,10 @@ class SchedulerControlClient:
                 (
                     UpdateWeightsFromMooncakeReqOutput,
                     self.update_weights_from_mooncake_communicator.handle_recv,
+                ),
+                (
+                    RebalanceExpertsReqOutput,
+                    self.rebalance_experts_communicator.handle_recv,
                 ),
                 (
                     UpdateWeightsFromTensorReqOutput,
@@ -245,10 +249,6 @@ class SchedulerControlClient:
                 (
                     SetInternalStateReqOutput,
                     self.set_internal_state_communicator.handle_recv,
-                ),
-                (
-                    ExpertDistributionReqOutput,
-                    self.expert_distribution_communicator.handle_recv,
                 ),
             ]
         )
@@ -330,24 +330,6 @@ class SchedulerControlClient:
             raise RuntimeError(result.message)
         return result
 
-    async def start_expert_distribution_record(self: AsyncLLM):
-        self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.START_RECORD)
-        )
-
-    async def stop_expert_distribution_record(self: AsyncLLM):
-        self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.STOP_RECORD)
-        )
-
-    async def dump_expert_distribution_record(self: AsyncLLM):
-        self.auto_create_handle_loop()
-        await self.expert_distribution_communicator(
-            ExpertDistributionReq(action=ExpertDistributionReqType.DUMP_RECORD)
-        )
-
     # Weight ops fan out to every attention-DP worker (the DP controller
     # broadcasts control requests) and the scheduler completes each one only
     # once every DP rank holds it at the head of its queue, so the replies
@@ -389,6 +371,20 @@ class SchedulerControlClient:
         self.auto_create_handle_loop()
         async with self.model_update_lock.writer_lock:
             results = await self.update_weights_from_mooncake_communicator(obj)
+        return combined_weight_update_output(results)
+
+    async def rebalance_experts(
+        self: AsyncLLM,
+        obj: RebalanceExpertsReqInput,
+    ) -> tuple[bool, str]:
+        """Start one online expert rebalance on every worker (``--enable-eplb``).
+
+        Fans out like the weight ops: every attention-DP worker queues the
+        request on its same-round gate and replies once the load snapshot was
+        taken; the weight moves follow in later rounds. The replies are ANDed.
+        """
+        self.auto_create_handle_loop()
+        results = await self.rebalance_experts_communicator(obj)
         return combined_weight_update_output(results)
 
     async def update_weights_from_tensor(

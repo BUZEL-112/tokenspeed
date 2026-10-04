@@ -48,6 +48,7 @@ import pytest
 import torch
 from tokenspeed_scheduler import PD
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
@@ -787,6 +788,8 @@ def test_the_handle_stays_a_closed_list_of_named_operations():
         "update_weights",
         "reset_expert_load",
         "dump_expert_load",
+        "snapshot_expert_load",
+        "apply_expert_placement",
     }
     assert {name for name in public if name.endswith("_work")} == {
         "run_multimodal_work"
@@ -926,7 +929,7 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
         ep_rank=1,
         ep_rank_nodes=(0, 0),
     )
-    placement.enable_load_recording()
+    placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
     trace: list = []
     streams: list = []
@@ -964,3 +967,173 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
     assert not placement.physical_load.any()
     with pytest.raises(RuntimeError, match="not being recorded"):
         handle.dump_expert_load(str(tmp_path / "none.pt"))
+
+
+def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards():
+    """Autotune, warm-up and capture route tokens through the MoE layers; the
+    builder zeroes the counters after capture (device drained, reset on the
+    execution stream) and before the handle exists, so the first window a
+    rebalance or profile sees is traffic only."""
+    import contextlib
+    import inspect
+    import textwrap
+
+    from tokenspeed.runtime.execution.device import (
+        build_device_side,
+        start_expert_load_window,
+    )
+    from tokenspeed.runtime.moe import expert_location
+
+    placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 0]]), 3, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
+    )
+    placement.enable_load_recording(Mapping(rank=0, world_size=2, moe_ep_size=2))
+    placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5]]))  # startup routes
+    trace: list = []
+
+    class _DeviceModule:
+        @staticmethod
+        def synchronize():
+            trace.append("synchronize")
+
+        @staticmethod
+        def stream(stream):
+            trace.append(("stream", stream))
+            return contextlib.nullcontext()
+
+    executor = SimpleNamespace(
+        device_module=_DeviceModule(), execution_stream="execution-stream"
+    )
+    expert_location.set_global_expert_location_metadata(placement)
+    try:
+        start_expert_load_window(executor)
+    finally:
+        expert_location.set_global_expert_location_metadata(None)
+    assert trace == ["synchronize", ("stream", "execution-stream")]
+    assert not placement.physical_load.any()
+    # Without load recording there is nothing to reset and nothing is touched.
+    start_expert_load_window(SimpleNamespace())
+
+    # The reset point: after the graphs are captured, before the handle is built.
+    tree = ast.parse(textwrap.dedent(inspect.getsource(build_device_side)))
+
+    def call_lines(name: str, attribute: bool) -> list[int]:
+        return [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+                if attribute
+                else (isinstance(node.func, ast.Name) and node.func.id == name)
+            )
+        ]
+
+    captures = call_lines("capture_graphs", attribute=True)
+    resets = call_lines("start_expert_load_window", attribute=False)
+    handles = call_lines("DeviceHandle", attribute=False)
+    assert len(resets) == 1 and captures and handles
+    assert max(captures) < resets[0] < min(handles)
+
+
+def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
+    """The online rebalance's window boundary: one data-plane crossing that
+    copies the counters to the host and zeroes them on the execution stream,
+    with no collective (the gate reduces the result afterwards)."""
+    import contextlib
+
+    from tokenspeed.runtime.moe import expert_location
+
+    placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 0], [2, 1, 0, 1]]),
+        3,
+        ep_size=2,
+        ep_rank=1,
+        ep_rank_nodes=(0, 0),
+    )
+    placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
+    placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
+    trace: list = []
+    streams: list = []
+
+    class _DeviceModule:
+        @staticmethod
+        def stream(stream):
+            streams.append(stream)
+            return contextlib.nullcontext()
+
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread(trace),
+            device_module=_DeviceModule(),
+            execution_stream="execution-stream",
+        )
+    )
+    expert_location.set_global_expert_location_metadata(placement)
+    try:
+        with mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=AssertionError("collective")
+        ):
+            snapshot = handle.snapshot_expert_load()
+    finally:
+        expert_location.set_global_expert_location_metadata(None)
+    assert trace == ["run"] and streams == ["execution-stream"]
+    assert snapshot.physical_count.tolist() == [[3, 1, 2, 5], [0, 4, 0, 4]]
+    assert snapshot.logical_count.tolist() == [[8, 1, 2], [0, 8, 0]]
+    assert torch.equal(
+        snapshot.physical_to_logical_map, placement.physical_to_logical_map_cpu
+    )
+    assert not placement.physical_load.any()
+
+
+def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream():
+    """A chunk is one blocking data-plane crossing: the updater moves the
+    weights and switches the tables inside the execution stream, and the
+    stream is synchronized before the call returns so a P2P failure surfaces
+    in the op's reply. Without --enable-eplb there is no updater to run."""
+    import contextlib
+
+    from tokenspeed.runtime.moe.expert_rebalance import SlotMoves
+
+    trace: list = []
+
+    class _Stream:
+        def synchronize(self):
+            trace.append("synchronize")
+
+    class _DeviceModule:
+        @staticmethod
+        def stream(stream):
+            trace.append(("stream", stream))
+            return contextlib.nullcontext()
+
+    class _Updater:
+        def apply(self, layer_ids, new_rows, moves_by_layer):
+            trace.append(("apply", tuple(layer_ids), new_rows.tolist(), moves_by_layer))
+
+    stream = _Stream()
+    moves = {0: SlotMoves(recv=(), send=(), local_copy=((1, 0),), free_rider=())}
+    rows = torch.tensor([[0, 0, 1, 2]])
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread(trace),
+            device_module=_DeviceModule(),
+            execution_stream=stream,
+            model_runner=SimpleNamespace(expert_location_updater=_Updater()),
+        )
+    )
+    handle.apply_expert_placement((0,), rows, moves)
+    assert trace == [
+        "run",
+        ("stream", stream),
+        ("apply", (0,), [[0, 0, 1, 2]], moves),
+        "synchronize",
+    ]
+    handle = DeviceHandle(
+        SimpleNamespace(
+            forward_thread=_ForwardThread([]),
+            model_runner=SimpleNamespace(expert_location_updater=None),
+        )
+    )
+    with pytest.raises(RuntimeError, match="--enable-eplb"):
+        handle.apply_expert_placement((0,), rows, moves)

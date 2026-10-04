@@ -163,6 +163,28 @@ afterwards, so chunked prefill and prefix-cache hits do not change a prompt
 logprob either -- the admission probe is capped at `logprob_start_len`
 (`scheduler.md` §1) so every scored position is actually recomputed.
 
+## Expert placement and online rebalancing
+
+An expert placement (`--ep-num-redundant-experts`, `--init-expert-location`)
+decides which rank computes which route. Under the rank-order MoE combine
+each rank's leaf returns a partial over its local slots and the host folds
+the partials in rank order, so the placement decides which routes land in
+which partial and a different placement moves the fold's rounding: the output
+is a function of the placement. A static placement is fixed per deployment
+and keeps the run-invariance contract; `--enable-eplb` makes the placement
+traffic-dependent state, so under the rank-order combine a rebalanced
+deployment is not run-invariant — not only across a rebalance, but across
+runs that rebalanced differently. The envelope therefore requires a
+placement-independent combine with `--enable-eplb`: every route computed on
+exactly one rank by a row-invariant leaf and the routes of a token folded in
+slot order (`--moe-combine-order slot`), which makes each route's value a
+pure function of the token and its logical expert's weights — replicas are
+byte-identical copies — and the output bitwise identical across rebalances.
+A build without that combine refuses `--enable-eplb` under the envelope. The
+load counters, the CPU-side algorithm and the P2P copies never enter the
+arithmetic; the dispatch algorithm stays static (required under rl-bitwise
+already) and drafts stay trivially placed.
+
 ## Acceptance
 
 The envelope is verified end to end, not per switch: the invariance harness
