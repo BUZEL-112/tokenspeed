@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -128,8 +129,11 @@ class DSABackend(PagedAttentionBackend):
         # leaves; without one registered, selection fails at the first decode
         # instead of silently serving an occupancy-split kernel.
         self.kernel_solution: str | None = (
-            "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+            "aok" if global_server_args_dict["numerics"] in BITWISE_ENVELOPES else None
         )
+        # --dsa-slot-order: how the cores reduce the selected slots
+        # (docs/design/numerics.md, invariance.batch).
+        self.slot_order: str = global_server_args_dict["dsa_slot_order"]
         self._prefill_page_table: torch.Tensor | None = None
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
@@ -638,6 +642,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            slot_order=self.slot_order,
         )
         if use_dcp:
             local_output, local_lse = out
@@ -786,6 +791,7 @@ class DSABackend(PagedAttentionBackend):
             k_scale=1.0,
             return_lse=use_dcp,
             solution=self.kernel_solution,
+            slot_order=self.slot_order,
         )
         if use_dcp:
             local_output, local_lse = out

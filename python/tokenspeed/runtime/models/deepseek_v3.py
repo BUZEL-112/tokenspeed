@@ -50,6 +50,7 @@ from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
@@ -504,7 +505,18 @@ class DeepseekV3AttentionMLA(nn.Module):
         reduce_attn_results=True,
         alt_stream: torch.cuda.Stream | None = None,
         skip_rope: bool = False,
+        q_lora_scale: float | None = None,
+        kv_lora_scale: float | None = None,
     ) -> None:
+        """
+        Args:
+            q_lora_scale: Runtime multiplier applied to ``q`` after
+                ``q_b_proj`` (LongCat's ``sqrt(hidden / q_lora_rank)`` under
+                ``--mla-lora-scale runtime``). None when the checkpoint has no
+                such scale or it is folded into ``q_a_layernorm``'s weight.
+            kv_lora_scale: Runtime multiplier applied to the latent after
+                ``kv_a_layernorm``; None as above.
+        """
         super().__init__()
         self.mapping = mapping
         self.layer_id = layer_id
@@ -515,6 +527,10 @@ class DeepseekV3AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        if q_lora_scale is not None and q_lora_rank is None:
+            raise ValueError("q_lora_scale needs a q_lora_rank to scale")
+        self.q_lora_scale = q_lora_scale
+        self.kv_lora_scale = kv_lora_scale
         self.num_heads = num_heads
         if num_heads % self.mapping.attn.tp_size != 0:
             raise ValueError(
@@ -703,7 +719,14 @@ class DeepseekV3AttentionMLA(nn.Module):
         comm_manager: CommManager,
         block_scale: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """QKV projection producing absorbed ``q`` and raw ``latent_cache``."""
+        """QKV projection producing absorbed ``q`` and raw ``latent_cache``.
+
+        The LoRA norm scales, when applied at runtime (``--mla-lora-scale
+        runtime``), multiply exactly where the trainer does: the latent right
+        after ``kv_a_layernorm`` (in place, so the cache sees the scaled
+        latent) and ``q`` right after ``q_b_proj``. ``q_norm`` itself stays
+        unscaled, which is the ``q_lora`` a DSA indexer must read.
+        """
         if self.q_lora_rank is not None:
             qkv = self.fused_qkv_a_proj_with_mqa(
                 hidden_states, block_scale, torch.bfloat16
@@ -719,13 +742,19 @@ class DeepseekV3AttentionMLA(nn.Module):
                 self.fused_qk_layernorm(
                     input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm
                 )
+                if self.kv_lora_scale is not None:
+                    kv_a.mul_(self.kv_lora_scale)
             q = self.q_b_proj(q_norm)[0]
+            if self.q_lora_scale is not None:
+                q = q * self.q_lora_scale
         else:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
             q = self.q_proj(hidden_states)[0]
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             kv_a = latent_cache[..., : self.kv_lora_rank]
             self.kv_a_layernorm(kv_a, out=kv_a)
+            if self.kv_lora_scale is not None:
+                kv_a.mul_(self.kv_lora_scale)
         return q, latent_cache
 
     @break_point
@@ -901,7 +930,9 @@ class DeepseekV3AttentionMLA(nn.Module):
             self.w_kc.transpose(1, 2),
             out=Q[..., : self.kv_lora_rank].transpose(0, 1),
             override=(
-                "aok" if global_server_args_dict["numerics"] == "rl-bitwise" else None
+                "aok"
+                if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+                else None
             ),
         )
         return self.attn_mqa.latent_prologue(

@@ -47,7 +47,7 @@ from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
-    _force_deterministic_rsag,
+    _dist_argmax_vetoed,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -291,7 +291,7 @@ class DFlash(BaseDrafter):
         shard = int(head.shard_indices.num_org_elements)
         tp_size = int(self.logits_processor.tp_size)
         if (
-            _force_deterministic_rsag()
+            _dist_argmax_vetoed()
             or not 2 <= tp_size <= 32
             or int(head.num_embeddings) != int(head.org_vocab_size)
             or shard * tp_size != int(head.org_vocab_size)
@@ -802,6 +802,10 @@ class DFlash(BaseDrafter):
                 return decline("the latent down-projection is quantized")
             if getattr(attn, "rotary_emb", None) is not rotary:
                 return decline("the draft's layers do not share one RoPE table")
+            if attn.kv_lora_scale is not None:
+                # The fused write norms the latent but applies no runtime
+                # scale (--mla-lora-scale runtime); the per-layer path does.
+                return decline("the latent carries a runtime LoRA norm scale")
             start = int(attn.q_lora_rank)
             weight_rows.append(weight[start : start + kv_width])
             norm_rows.append(attn.kv_a_layernorm.weight)

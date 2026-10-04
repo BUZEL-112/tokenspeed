@@ -32,8 +32,16 @@ from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_S
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
+    DSA_SLOT_ORDERS,
+    LAYER_BOUNDARY_NORMS,
+    LOGPROB_ORDERS,
+    MLA_LORA_SCALES,
+    MOE_COMBINE_ORDERS,
     NUMERICS_ENVELOPES,
     RL_BITWISE_SAMPLING_BACKENDS,
+    ROUTER_TOPKS,
+    SAMPLING_STREAMS,
+    YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.moe.dispatch_algorithm import (
@@ -156,6 +164,16 @@ def validate_dcp_disaggregation_role(
             f"null or prefill (got {disaggregation_mode!r}): only the prefill "
             "side of a PD transfer can be DCP-sharded"
         )
+
+
+def _require_choice(flag: str, value: str, choices: tuple[str, ...]) -> None:
+    """Refuse a launch value outside ``flag``'s closed set of ``choices``.
+
+    ServerArgs is the one place a closed-set flag is validated; consumers
+    read the resolved value and trust it.
+    """
+    if value not in choices:
+        raise ValueError(f"{flag} must be one of {list(choices)}, got {value!r}")
 
 
 @dataclasses.dataclass
@@ -331,6 +349,12 @@ class ServerArgs:
     # (default) is exact dense attention; see --skip-softmax-threshold help.
     skip_softmax_threshold: float = 0.0
     sampling_backend: str | None = None
+    # Random stream of the non-greedy rows of the FlashInfer sampling backends:
+    # "batch" keys flashinfer's Philox stream by the batch row, so a request's
+    # draw depends on its co-batch; "per-request" keys it by (request seed,
+    # position) through the Gumbel-max pool kernels. See
+    # docs/design/numerics.md, sampling.deterministic.
+    sampling_stream: str = "batch"
     dp_sampling: bool = False
     dp_sampling_min_bs: int | None = None
     attention_use_fp4_indexer_cache: bool | None = None
@@ -408,10 +432,40 @@ class ServerArgs:
     batch_invariant_collectives: bool = False
     disable_sampling_tp_sync: bool = False
     # Numerics envelope: "auto" keeps every performance default; "rl-bitwise"
-    # asks for bitwise run-to-run and batch-composition invariance and folds
-    # the determinism switches below (resolve_numerics). Each folded switch
-    # can still be set individually; the umbrella only ever tightens.
+    # asks for bitwise run-to-run and batch-composition invariance and the
+    # trainer's operation order, and folds the determinism and trainer-order
+    # switches below (resolve_numerics). Each folded switch can still be set
+    # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # Trainer-operation-order switches (docs/design/numerics.md,
+    # alignment.trainer). Each keeps the engine's own form by default and is
+    # folded to the trainer's form by --numerics rl-bitwise.
+    # Device that computes the deepseek_yarn RoPE inverse frequencies (the
+    # position frequencies, both divisions and the YaRN linear ramp mask).
+    yarn_ramp_mask_device: str = "cuda"
+    # Where LongCat-style MLA applies its sqrt(hidden / lora_rank) norm scales:
+    # folded into the q_a/kv_a layernorm weights at load, or multiplied at
+    # runtime after q_b_proj / kv_a_layernorm as the trainer does.
+    mla_lora_scale: str = "folded"
+    # The norm at each physical layer boundary (a layer's first norm, the
+    # final norm): the fused add+norm kernel, or a bf16 `hidden + residual`
+    # materialized first as the trainer does.
+    layer_boundary_norm: str = "fused"
+    # Correction-bias MoE routing: the fused CUDA kernel, or fp32 torch.softmax
+    # + torch.topk(probs + bias) in PyTorch tie order as the trainer does.
+    router_topk: str = "fused"
+    # Order of the selected-token log-softmax: torch.log_softmax, or
+    # Megatron's vocab-parallel cross-entropy over fixed 32768-wide vocab
+    # blocks. Changes the reported logprobs only, never the sampled tokens.
+    logprob_order: str = "torch"
+    # How a token's routed-expert contributions meet across the MoE TP-EP
+    # group: per-rank partials summed by the host (rank), or folded in fp32
+    # slot order inside the MoE leaf as the trainer does (slot).
+    moe_combine_order: str = "rank"
+    # The order the sparse attention cores reduce a token's selected KV slots
+    # in: as the top-k leaf emitted them (selection), or ascending (sorted,
+    # batch-invariant whenever the selected set is).
+    dsa_slot_order: str = "selection"
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -625,8 +679,25 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
-        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
-            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
+        _require_choice(
+            "--dense-gemm-backend", self.dense_gemm_backend, ("auto", "trtllm_cutedsl")
+        )
+        # The numerics switches (docs/design/numerics.md) are closed sets.
+        for flag, value, choices in (
+            ("--sampling-stream", self.sampling_stream, SAMPLING_STREAMS),
+            (
+                "--yarn-ramp-mask-device",
+                self.yarn_ramp_mask_device,
+                YARN_RAMP_MASK_DEVICES,
+            ),
+            ("--mla-lora-scale", self.mla_lora_scale, MLA_LORA_SCALES),
+            ("--layer-boundary-norm", self.layer_boundary_norm, LAYER_BOUNDARY_NORMS),
+            ("--router-topk", self.router_topk, ROUTER_TOPKS),
+            ("--logprob-order", self.logprob_order, LOGPROB_ORDERS),
+            ("--moe-combine-order", self.moe_combine_order, MOE_COMBINE_ORDERS),
+            ("--dsa-slot-order", self.dsa_slot_order, DSA_SLOT_ORDERS),
+        ):
+            _require_choice(flag, value, choices)
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -1014,28 +1085,60 @@ class ServerArgs:
 
         ``rl-bitwise`` is the RL rollout contract: within one deployment the
         same request produces bitwise-identical tokens and logprobs across
-        runs and regardless of batch composition. The umbrella only ever
-        tightens: it sets every switch it governs to its tight value and
-        refuses explicit choices it cannot tighten (a named MoE or sampling
-        backend without the guarantee). Each derived switch remains
-        individually available for auto mode. Whether the served model is
-        verified under the envelope is checked once its profile is known
-        (``require_verified_numerics``).
+        runs and regardless of batch composition, and the forward follows the
+        training framework's operation order wherever the two engines differ
+        (``_resolve_rl_bitwise``). The umbrella only ever tightens: it sets
+        every switch it governs to its tight value and refuses explicit
+        choices it cannot tighten (a named MoE or sampling backend without the
+        guarantee). Each derived switch remains individually available for
+        auto mode. Whether the served model is verified under the envelope is
+        checked once its profile is known (``require_verified_numerics``).
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
-        if self.numerics == "auto":
-            return
-        if self.numerics not in NUMERICS_ENVELOPES:
-            raise ValueError(
-                f"--numerics must be one of {list(NUMERICS_ENVELOPES)}, got "
-                f"{self.numerics!r}"
-            )
-        # Collectives: rank-ordered NCCL instead of the symmetric-memory and
-        # trtllm fused paths, and the all-reduce becomes an all-gather with a
-        # fixed-rank-order fp32 fold: NCCL's ring chunks by message size, so
-        # a plain NCCL sum is run-stable but not batch-size-invariant.
-        self.force_deterministic_rsag = True
+        _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        if self.numerics != "auto":
+            self._resolve_rl_bitwise()
+        # Individual switches that veto a fusion resolve_communication may
+        # have auto-enabled, whatever the envelope. CommManager.should_fuse
+        # re-derives the veto from the switches, so the fused kernels stay off
+        # even where this flag is read before the fold.
+        if self.layer_boundary_norm == "unfused":
+            # The fused all-reduce+norm kernels add the residual inside the
+            # fusion; the unfused boundary norm needs the bf16 sum first.
+            self.enable_allreduce_fusion = False
+        if self.moe_combine_order == "slot":
+            # The MoE leaf returns complete rows; a fused all-reduce+norm at
+            # the next layer boundary would sum them tp_size times.
+            self.enable_allreduce_fusion = False
+            # The slot-order fold runs over the EP group inside the MoE leaf:
+            # a K-split (MoE TP) down projection would need a second,
+            # rank-ordered fold after it, and DeepEP's all-to-all owns that
+            # exchange itself (and hands the leaf a NCCL group, not the EP
+            # device group the fold runs on).
+            if self.mapping.moe.tp_size != 1:
+                raise ValueError(
+                    "--moe-combine-order slot needs MoE TP 1: a K-split down "
+                    "projection would need a second, rank-ordered fold after "
+                    f"the slot-order one (got --moe-tp-size {self.mapping.moe.tp_size})"
+                )
+            if self.all2all_backend == "deepep":
+                raise ValueError(
+                    "--moe-combine-order slot folds the routed outputs over the "
+                    "EP group inside the MoE leaf; --all2all-backend deepep "
+                    "performs that exchange itself and cannot be combined with it"
+                )
+
+    def _resolve_rl_bitwise(self):
+        """The rl-bitwise block: every envelope beyond auto runs it."""
+        # Collectives: one association order per reduction. NCCL's ring
+        # chunks by message size, so a plain NCCL sum is run-stable but not
+        # batch-size-invariant; batch_invariant_collectives routes the
+        # all-reduce to the NVLS in-switch reduction with a fixed issuer where
+        # multicast reaches (verified bitwise at startup) and every other
+        # reduction to the rank-ordered fp32 fold (comm_backend/auto.py).
+        # force_deterministic_rsag stays the user's "NCCL and the fold only"
+        # knob; the envelope does not set it.
         self.batch_invariant_collectives = True
         self.enable_allreduce_fusion = False
         self.comm_fusion_max_num_tokens = -1
@@ -1051,25 +1154,50 @@ class ServerArgs:
             self.moe_backend = "aok"
         elif self.moe_backend != "aok":
             raise ValueError(
-                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
-                f"'aok'; --moe-backend {self.moe_backend} makes no such claim"
+                f"--numerics {self.numerics} needs the batch-invariant MoE "
+                f"solution 'aok'; --moe-backend {self.moe_backend} makes no such "
+                "claim"
             )
         if self.draft_moe_backend == "auto":
             self.draft_moe_backend = "aok"
         elif self.draft_moe_backend not in (None, "aok"):
             raise ValueError(
-                f"--numerics rl-bitwise needs the batch-invariant MoE solution "
-                f"'aok'; --draft-moe-backend {self.draft_moe_backend} makes no "
-                "such claim"
+                f"--numerics {self.numerics} needs the batch-invariant MoE "
+                f"solution 'aok'; --draft-moe-backend {self.draft_moe_backend} "
+                "makes no such claim"
             )
-        # Sampling: greedy rows must break exact logit ties canonically.
+        # Sampling: greedy rows must break exact logit ties canonically, and
+        # sampled rows must draw from a stream the co-batch cannot move.
         if self.sampling_backend not in RL_BITWISE_SAMPLING_BACKENDS:
             raise ValueError(
-                f"--numerics rl-bitwise needs a sampling backend with canonical "
-                f"greedy tie-breaking ({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); "
-                f"--sampling-backend {self.sampling_backend} resolves exact "
-                "ties in reduction order"
+                f"--numerics {self.numerics} needs a sampling backend with "
+                "canonical greedy tie-breaking "
+                f"({sorted(RL_BITWISE_SAMPLING_BACKENDS)}); --sampling-backend "
+                f"{self.sampling_backend} resolves exact ties in reduction order"
             )
+        self.sampling_stream = "per-request"
+        # Sparse attention: the tuned top-k kernels' tie order moves with the
+        # batch shape, so the cores reduce the selected slots sorted; the
+        # batch-invariant cores the envelope pins declare the trait.
+        self.dsa_slot_order = "sorted"
+        # Trainer alignment: the training framework's operation order wherever
+        # the two engines are known to differ. Each switch is documented in
+        # ``docs/design/numerics.md`` under "alignment.trainer".
+        # The trainer builds its RoPE inverse frequencies on the host; CPU and
+        # CUDA division round each of them differently at ulp level.
+        self.yarn_ramp_mask_device = "cpu"
+        # The trainer multiplies the LoRA norm scales as separate bf16 ops.
+        self.mla_lora_scale = "runtime"
+        # The trainer materializes each layer's bf16 output before the next
+        # layer's norm reads it.
+        self.layer_boundary_norm = "unfused"
+        # The trainer's router is softmax + topk(scores + bias) in torch.
+        self.router_topk = "torch"
+        # The trainer's logprobs come from its vocab-parallel cross-entropy.
+        self.logprob_order = "megatron"
+        # The trainer's grouped MLP applies the router weight inside the
+        # activation and folds a token's slots in fp32 slot order.
+        self.moe_combine_order = "slot"
 
     def resolve_disaggregation(self):
         # Pipeline parallelism is a prefill-node-only capability: the chunk
@@ -1371,16 +1499,16 @@ class ServerArgs:
                     f"ranks, but the MoE layers run with ep_size="
                     f"{self.mapping.moe.ep_size}; enable expert parallelism."
                 )
-            if self.numerics != "auto":
+            if self.numerics != "auto" and self.moe_combine_order != "slot":
                 # Under a bitwise envelope the rank-order MoE combine makes the
-                # output depend on the placement, which a rebalance changes.
-                # The slot-order combine (--moe-combine-order slot) is
-                # placement-independent; this build has no such flag yet, so
-                # the combination is refused until it lands.
+                # output depend on the placement, which a rebalance changes;
+                # the slot-order combine is placement-independent. The
+                # envelope folds it in resolve_numerics, so this only guards
+                # that fold.
                 raise ValueError(
                     f"--enable-eplb under --numerics {self.numerics} requires "
                     "--moe-combine-order slot (a placement-independent MoE "
-                    "combine), which this build does not provide."
+                    f"combine); got {self.moe_combine_order!r}."
                 )
         elif (
             self.eplb_rebalance_num_iterations is not None
@@ -2203,6 +2331,20 @@ class ServerArgs:
             "Finite top_k values must be < 128 or -1.",
         )
         parser.add_argument(
+            "--sampling-stream",
+            type=str,
+            choices=list(SAMPLING_STREAMS),
+            default=ServerArgs.sampling_stream,
+            help="Random stream of the non-greedy rows of the flashinfer and "
+            "flashinfer_full sampling backends. 'batch': flashinfer's "
+            "top_k_top_p / min_p sampling kernels, whose Philox stream is keyed "
+            "by the batch row, so a request's draw depends on its co-batch. "
+            "'per-request': the Gumbel-max pool kernels keyed by the request's "
+            "seed and position, so a request samples the same tokens alone and "
+            "inside any batch (finite top_k is capped at 128). Folded to "
+            "per-request by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
             "--dp-sampling",
             action="store_true",
             default=ServerArgs.dp_sampling,
@@ -2695,16 +2837,26 @@ class ServerArgs:
         parser.add_argument(
             "--force-deterministic-rsag",
             action="store_true",
-            help="Use NCCL collectives instead of Triton symmetric-memory "
-            "all-reduce/gather/scatter.",
+            help="NCCL and the rank-ordered fold only: no symmetric-memory "
+            "path -- neither the Triton multicast all-gather/reduce-scatter "
+            "and in-switch all-reduce, nor the trtllm and Triton all-reduce "
+            "tiers, nor the distributed argmax. With --batch-invariant-collectives every "
+            "reduction takes the fold; without it, NCCL. Not folded in by "
+            "--numerics rl-bitwise, which keeps the multicast paths and "
+            "verifies the in-switch reduction at startup.",
         )
         parser.add_argument(
             "--batch-invariant-collectives",
             action="store_true",
-            help="Run every all-reduce as an all-gather plus a fixed-rank-order "
-            "fp32 fold. NCCL sums are run-stable but chunk by message size, so "
-            "they are not batch-size-invariant; the fold is. Costs world_size "
-            "times the all-reduce traffic. Folded in by --numerics rl-bitwise.",
+            help="One association order per reduction, independent of the "
+            "batch. A 2-D bf16 all-reduce on a multicast-reachable group runs "
+            "as the NVLS in-switch reduction issued by one fixed rank, "
+            "verified bitwise at startup; every other reduction (other "
+            "payloads, unreachable groups, the reduce-scatters) runs as NCCL "
+            "data movement plus a fixed-rank-order fp32 fold, which for an "
+            "all-reduce costs world_size times the traffic. NCCL sums are "
+            "run-stable but chunk by message size, so they are not "
+            "batch-size-invariant. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
@@ -2712,9 +2864,106 @@ class ServerArgs:
             choices=list(NUMERICS_ENVELOPES),
             default=ServerArgs.numerics,
             help="Numerics envelope. rl-bitwise folds the determinism "
-            "switches (deterministic collectives, no autotune/TF32/PDL, no "
-            "fused all-reduce) so outputs and logprobs are bitwise identical "
-            "across runs and batch compositions within one deployment.",
+            "switches (batch-invariant collectives, no autotune/TF32/PDL, no "
+            "fused all-reduce, the batch-invariant MoE leaves, per-request "
+            "sampling) so outputs and logprobs are bitwise identical across "
+            "runs and batch compositions within one deployment, and the "
+            "trainer-operation-order switches (docs/design/numerics.md, "
+            "alignment.trainer) so a teacher-forced pass reproduces the RL "
+            "trainer's logprobs; a model serves it only once its profile "
+            "declares it verified.",
+        )
+        parser.add_argument(
+            "--yarn-ramp-mask-device",
+            type=str,
+            choices=list(YARN_RAMP_MASK_DEVICES),
+            default=ServerArgs.yarn_ramp_mask_device,
+            help="Device that computes the deepseek_yarn RoPE inverse "
+            "frequencies (the position frequencies, both divisions and the "
+            "YaRN linear ramp mask) before the table is moved to the model "
+            "device once. The trainer builds it on the host, and CPU and CUDA "
+            "division round differently at ulp level. Folded to cpu by "
+            "--numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--mla-lora-scale",
+            type=str,
+            choices=list(MLA_LORA_SCALES),
+            default=ServerArgs.mla_lora_scale,
+            help="Where LongCat-style MLA applies its sqrt(hidden / lora_rank) "
+            "norm scales. 'folded': into the q_a_layernorm / kv_a_layernorm "
+            "weights after loading. 'runtime': as separate bf16 multiplies "
+            "after q_b_proj and after kv_a_layernorm, as the trainer does; the "
+            "norm weights are never rewritten and the DSA indexer reads the "
+            "unscaled q_lora. Folded to runtime by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--layer-boundary-norm",
+            type=str,
+            choices=list(LAYER_BOUNDARY_NORMS),
+            default=ServerArgs.layer_boundary_norm,
+            help="The norm at each physical layer boundary (a layer's first "
+            "norm and the final norm). 'fused': the fused add+norm kernel, "
+            "whose residual sum stays fp32 into the norm. 'unfused': "
+            "hidden + residual is materialized in bf16 first, then a "
+            "standalone RMSNorm, as the trainer does; all-reduce+norm fusion "
+            "is vetoed with it. Folded to unfused by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--router-topk",
+            type=str,
+            choices=list(ROUTER_TOPKS),
+            default=ServerArgs.router_topk,
+            help="Correction-bias MoE routing (LongCat). 'fused': the fused "
+            "CUDA softmax+bias+top-k kernel. 'torch': fp32 torch.softmax, "
+            "torch.topk(probs + bias, sorted=True) in PyTorch tie order, "
+            "weights = unbiased probs x routed_scaling_factor, zero experts "
+            "become id -1 and keep their weight, as the trainer does. Folded "
+            "to torch by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--logprob-order",
+            type=str,
+            choices=list(LOGPROB_ORDERS),
+            default=ServerArgs.logprob_order,
+            help="Order of the selected-token log-softmax behind every "
+            "returned logprob. 'torch': torch.log_softmax. 'megatron': the "
+            "trainer's vocab-parallel cross-entropy order (row max, shift, "
+            "sum(exp) over fixed 32768-wide vocab blocks folded in block "
+            "order, logp = -(log(sum_exp) - target)); requests asking for "
+            "temperature- or top-p-normalised logprobs are refused. Changes "
+            "logprobs only, never the sampled tokens. Folded to megatron by "
+            "--numerics rl-bitwise.",
+        )
+        parser.add_argument(
+            "--moe-combine-order",
+            type=str,
+            choices=list(MOE_COMBINE_ORDERS),
+            default=ServerArgs.moe_combine_order,
+            help="How a token's routed-expert contributions meet across the "
+            "MoE TP-EP group. 'rank': the MoE kernel returns this rank's "
+            "partial and the host sums the partials (all-reduce or "
+            "reduce-scatter), adding the identity zero-expert residual once "
+            "around it. 'slot': the MoE kernel folds the token's top-k slots "
+            "in fp32 slot order across the EP group itself, zero-expert "
+            "residual included, as the trainer's grouped MLP does, and the "
+            "host reduces nothing; needs MoE TP 1 and a kernel declaring the "
+            "combine_order trait with slot (the batch-invariant 'aok' leaf), "
+            "and vetoes all-reduce+norm fusion. Folded to slot by --numerics "
+            "rl-bitwise.",
+        )
+        parser.add_argument(
+            "--dsa-slot-order",
+            type=str,
+            choices=list(DSA_SLOT_ORDERS),
+            default=ServerArgs.dsa_slot_order,
+            help="The order the sparse (DSA) attention cores reduce a token's "
+            "selected KV slots in. 'selection': as the top-k leaf emitted "
+            "them (every core). 'sorted': ascending slot order, so the "
+            "reduction is batch-invariant whenever the selected set is; "
+            "served only by cores declaring the slot_order trait (the "
+            "batch-invariant 'aok' leaves). Folded to sorted by --numerics "
+            "rl-bitwise.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

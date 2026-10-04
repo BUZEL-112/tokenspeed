@@ -40,6 +40,10 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
+from tokenspeed.runtime.configs.numerics import (
+    BITWISE_ENVELOPES,
+    MEGATRON_VOCAB_BLOCK,
+)
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -59,7 +63,7 @@ from tokenspeed.runtime.sampling.logits_layout import (
     LogitsLayoutExecutor,
     LogitsLayoutPlan,
 )
-from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -109,9 +113,24 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 def _force_deterministic_rsag() -> bool:
+    """``--force-deterministic-rsag``: NCCL only, even for the pure-data-movement
+    multicast gather of the logits."""
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     return bool(global_server_args_dict.get("force_deterministic_rsag", False))
+
+
+def _dist_argmax_vetoed() -> bool:
+    """Whether the distributed argmax (a cross-rank reduction over symmetric
+    memory) stays off: under ``--force-deterministic-rsag`` like every
+    symmetric-memory path, and under the bitwise envelope, which was verified
+    with the gather plus the canonical local argmax and pins that form."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    return (
+        _force_deterministic_rsag()
+        or global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+    )
 
 
 @dataclasses.dataclass
@@ -250,6 +269,22 @@ class LogitsProcessor(nn.Module):
         self.dp_sampling_min_bs = 0
         self.logit_scale = logit_scale
         self._logits_layout_executor: LogitsLayoutExecutor | None = None
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # --logprob-order: the log-softmax behind input (prompt) logprobs.
+        self.logprob_order: str = global_server_args_dict["logprob_order"]
+        if (
+            self.logprob_order == "megatron"
+            and config.vocab_size % MEGATRON_VOCAB_BLOCK != 0
+        ):
+            # The logits every logprob reads are sliced to config.vocab_size
+            # (_get_logits), and the trainer's sum(exp) folds fixed-width
+            # blocks of them; refuse at construction, not on the forward thread.
+            raise ValueError(
+                "--logprob-order megatron folds sum(exp) over fixed "
+                f"{MEGATRON_VOCAB_BLOCK}-wide vocabulary blocks and needs a "
+                f"vocab_size that is a multiple of it; got {config.vocab_size}"
+            )
 
         if tp_rank is None:
             if tp_size is not None or tp_group is not None:
@@ -471,7 +506,7 @@ class LogitsProcessor(nn.Module):
         return state
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
-        if _force_deterministic_rsag():
+        if _dist_argmax_vetoed():
             return None
         if not 2 <= self.tp_size <= 32:
             return None  # the kernel's cross-rank reduce is a single warp shuffle
@@ -614,9 +649,10 @@ class LogitsProcessor(nn.Module):
         LM head ``chunk_tokens`` at a time so the transient ``[rows, vocab]``
         logits stay bounded; each chunk takes the same ``_get_logits`` route
         as the sampled rows (quantized head, rl-bitwise GEMM, TP gather,
-        softcap) and the sampler's own ``gather_token_logprobs_torch``, so
-        prompt and output logprobs of one token agree bitwise. Log-softmax is
-        row-local, so the chunk size never changes a value. The chunks ask for
+        softcap) and the sampler's own ``gather_token_logprobs`` in the
+        launch's ``--logprob-order``, so prompt and output logprobs of one
+        token agree bitwise. Both orders are row-local, so the chunk size
+        never changes a value. The chunks ask for
         a private full-vocab tensor (``require_full_vocab=True``): the
         multicast gather returns a view of the TP group's shared buffer that
         the next chunk's gather on a faster rank would overwrite while this
@@ -658,8 +694,8 @@ class LogitsProcessor(nn.Module):
                 plan=None,
                 require_full_vocab=True,
             )
-            out[begin:end] = gather_token_logprobs_torch(
-                logits, plan.targets[begin:end]
+            out[begin:end] = gather_token_logprobs(
+                logits, plan.targets[begin:end], logprob_order=self.logprob_order
             )
             del logits
         return out
@@ -710,7 +746,7 @@ class LogitsProcessor(nn.Module):
         elif hasattr(lm_head, "weight"):
             from tokenspeed.runtime.utils.env import global_server_args_dict
 
-            if global_server_args_dict["numerics"] == "rl-bitwise":
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
                 import tokenspeed_kernel
 
                 logits = tokenspeed_kernel.mm(

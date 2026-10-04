@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling import vocab_parallel_logprobs
 
+from tokenspeed.runtime.configs.numerics import MEGATRON_VOCAB_BLOCK
 from tokenspeed.runtime.utils import crash_on_warnings, get_colorful_logger
 
 logger = get_colorful_logger(__name__)
@@ -75,3 +77,29 @@ def gather_token_logprobs_torch(
     """
     raw_logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float32)
     return raw_logprobs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+
+
+def gather_token_logprobs(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+    *,
+    logprob_order: str,
+) -> torch.Tensor:
+    """Return each row's log probability of ``tokens`` in the launch's order.
+
+    Args:
+        logits: ``[rows, vocab]`` logits.
+        tokens: ``[rows]`` integer token ids.
+        logprob_order: ``"torch"`` for ``torch.log_softmax``; ``"megatron"``
+            for the trainer's vocab-parallel cross-entropy order over fixed
+            32768-wide vocab blocks (``--logprob-order``, validated by
+            ServerArgs).
+
+    Returns:
+        ``[rows]`` fp32 log probabilities.
+    """
+    if logprob_order == "megatron":
+        return vocab_parallel_logprobs(
+            logits, tokens.to(torch.int64), vocab_block=MEGATRON_VOCAB_BLOCK
+        )
+    return gather_token_logprobs_torch(logits, tokens)

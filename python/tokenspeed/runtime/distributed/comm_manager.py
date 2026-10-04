@@ -119,6 +119,16 @@ class CommManager:
         self.prev_is_moe = prev_is_moe
         self.input_layernorm = input_layernorm
         self.post_attn_layernorm = post_attn_layernorm
+        # utils.env imports server_args, which imports this package: resolve
+        # the launch options lazily, as the fusion predicates below do.
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        # --layer-boundary-norm: how input_reduce_norm and final_norm add the
+        # residual (docs/design/numerics.md, alignment.trainer).
+        self.layer_boundary_norm: str = global_server_args_dict["layer_boundary_norm"]
+        # --moe-combine-order: whether the MoE leaf already combined the routed
+        # output across the MoE TP-EP group (post_moe_comm).
+        self.moe_combine_order: str = global_server_args_dict["moe_combine_order"]
 
     # ---- Scattered token counts ----
 
@@ -364,8 +374,25 @@ class CommManager:
     def post_moe_comm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
     ):
+        """Bring the routed-expert output back to this rank's layout.
+
+        Under ``--moe-combine-order rank`` the MoE leaf returned this rank's
+        partial and the group sums them here (all-reduce, or reduce-scatter
+        in the RSAG layout). Under ``slot`` the leaf already folded every
+        token's slots across the EP group, so the rows are complete on every
+        rank and nothing is reduced; in the RSAG layout this rank still takes
+        back its own token rows, as the reduce-scatter would have.
+        """
         if not self.mapping.moe.has_tp_ep:
             return hidden_states, residual
+
+        if self.moe_combine_order == "slot":
+            if self.use_all_reduce(is_moe=True):
+                return hidden_states, residual
+            token_list = self.moe_tp_ep_group_scattered_num_tokens(ctx)
+            offset = sum(token_list[: self.mapping.moe.tp_ep_rank])
+            own = token_list[self.mapping.moe.tp_ep_rank]
+            return hidden_states[offset : offset + own], residual
 
         if self.use_all_reduce(is_moe=True):
             hidden_states = all_reduce(hidden_states, self.mapping.moe.tp_ep_group)
@@ -405,32 +432,79 @@ class CommManager:
         )
 
     def should_fuse(self, num_tokens: int) -> bool:
+        """Whether this launch's fused all-reduce+norm kernel runs here.
+
+        The trainer-order switches veto it at the point that relies on the
+        veto, not only in ``resolve_numerics``: the unfused boundary norm needs
+        the bf16 ``hidden + residual`` materialized first, and the slot-order
+        MoE combine returns complete rows a fused all-reduce would sum
+        ``tp_size`` times.
+        """
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
+        if self.layer_boundary_norm == "unfused" or self.moe_combine_order == "slot":
+            return False
         return (
             self.use_all_reduce_norm_fusion()
             and num_tokens > 0
             and num_tokens <= global_server_args_dict["comm_fusion_max_num_tokens"]
         )
 
+    def _fused_add_norm(
+        self,
+        norm: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add the residual and normalize in one kernel (the fp32 sum feeds
+        the norm), fused with the all-reduce when the launch allows it."""
+        if self.should_fuse(hidden_states.shape[0]):
+            hidden_states, residual, *_ = norm.forward_with_allreduce_fusion(
+                self.mapping.attn.tp_rank,
+                self.mapping.attn.tp_group,
+                hidden_states,
+                residual,
+            )
+        else:
+            hidden_states, residual = norm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _unfused_add_norm(
+        norm: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The trainer's layer boundary: the bf16 sum is materialized and is
+        both the new residual and the norm's input."""
+        hidden_states = hidden_states + residual
+        residual = hidden_states
+        hidden_states = norm(hidden_states)
+        return hidden_states, residual
+
     def input_reduce_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor | None
     ):
+        """The norm that opens a physical layer, consuming the previous
+        layer's output (``--layer-boundary-norm``)."""
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif self.should_fuse(hidden_states.shape[0]):
-            hidden_states, residual, *_ = (
-                self.input_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
-                    hidden_states,
-                    residual,
-                )
+        elif self.layer_boundary_norm == "unfused":
+            hidden_states, residual = self._unfused_add_norm(
+                self.input_layernorm, hidden_states, residual
             )
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self._fused_add_norm(
+                self.input_layernorm, hidden_states, residual
+            )
         return hidden_states, residual
+
+    def intra_layer_add_norm(self, hidden_states: torch.Tensor, residual: torch.Tensor):
+        """An add+norm inside a physical layer on ``input_layernorm`` (LongCat's
+        second attention branch). Not a layer boundary, so it keeps the fused
+        form under every ``--layer-boundary-norm``, as the trainer does."""
+        return self._fused_add_norm(self.input_layernorm, hidden_states, residual)
 
     def post_attn_reduce_norm(
         self, hidden_states: torch.Tensor, residual: torch.Tensor, ctx: ForwardContext
@@ -467,7 +541,12 @@ class CommManager:
         if ctx.forward_mode.is_idle():
             return hidden_states, None
 
-        if self.should_fuse(hidden_states.shape[0]):
+        if self.layer_boundary_norm == "unfused":
+            hidden_states, residual_out = self._unfused_add_norm(
+                norm, hidden_states, residual
+            )
+            hidden_states, _ = self.post_final_norm_comm(hidden_states, residual, ctx)
+        elif self.should_fuse(hidden_states.shape[0]):
             hidden_states, residual_out, *_ = norm.forward_with_allreduce_fusion(
                 self.mapping.attn.tp_rank,
                 self.mapping.attn.tp_group,

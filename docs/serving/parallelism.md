@@ -400,8 +400,8 @@ The routing path is unchanged: slot ownership stays contiguous per rank, the
 replica choice is a pure function of the token, and a placement change alters
 only table entries and slot contents. Under `--numerics rl-bitwise` the
 MoE combine must be placement-independent (slot-order combine) for the
-output to stay bitwise identical across a rebalance; a build without that
-combine refuses `--enable-eplb` under the envelope (see
+output to stay bitwise identical across a rebalance; the envelope folds
+`--moe-combine-order slot` in, so the combination is accepted (see
 `docs/design/numerics.md`).
 
 ## Multi-Node
@@ -493,6 +493,19 @@ all-gather/reduce-scatter runs on the Triton RSAG backend and uses NCCL
 across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. This is required for layouts such as attention DP
 with dense TP or MoE EP spanning nodes.
+
+Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) the
+all-reduce on a multicast-reachable group is the NVLS in-switch reduction
+issued by the group's rank 0 through the same RSAG buffers, verified
+bitwise at startup on every group it will serve; a kind whose groups the
+switch reduces in different orders (several TP groups of three or more
+GPUs) is kept on the fold and logged. The reduce-scatters, other payloads
+and unreachable groups take NCCL data movement plus a rank-ordered fp32
+fold, and the gathers stay on the multicast kernels. The distributed argmax
+and the fused all-reduce kernels are off. `--force-deterministic-rsag` keeps
+every collective on NCCL (reductions on the fold). `AutoBackend.route` is
+the one place that decides; `docs/design/numerics.md` has the measured
+basis.
 
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled

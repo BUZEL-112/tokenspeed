@@ -51,7 +51,7 @@ from tokenspeed.runtime.sampling.backends.base import (
 from tokenspeed.runtime.sampling.registry import register_backend
 from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, _TOP_K_DISABLED
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
-from tokenspeed.runtime.sampling.utils import nan_guard_logits
+from tokenspeed.runtime.sampling.utils import gather_token_logprobs, nan_guard_logits
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
@@ -127,11 +127,6 @@ class TritonSamplingBackend(SamplingBackend):
         )
 
     def _init_triton_buffers(self, config: SamplingBackendConfig) -> None:
-        pool_rows = config.max_req_pool_size + 1
-        self._zero_offsets_pool = torch.zeros(
-            (pool_rows,), dtype=torch.int64, device=config.device
-        )
-
         vocab_size = max(int(config.vocab_size), 1)
         gumbel_scratch = gumbel_scratch_shape(config.max_bs, vocab_size)
         self._gumbel_local_ids = torch.empty(
@@ -141,9 +136,6 @@ class TritonSamplingBackend(SamplingBackend):
             gumbel_scratch, dtype=torch.float32, device=config.device
         )
         self._gumbel_out = torch.empty(
-            (config.max_bs,), dtype=torch.int32, device=config.device
-        )
-        self._req_pool_indices_i32 = torch.empty(
             (config.max_bs,), dtype=torch.int32, device=config.device
         )
         self._gumbel_verify_out = torch.empty(
@@ -253,21 +245,6 @@ class TritonSamplingBackend(SamplingBackend):
             (top_p_rows,), dtype=torch.float32, device=config.device
         )
 
-    def _req_pool_indices_for_kernels(
-        self, req_pool_indices: torch.Tensor, rows: int
-    ) -> torch.Tensor:
-        req_pool_indices = req_pool_indices[:rows]
-        if req_pool_indices.dtype == torch.int32:
-            return req_pool_indices
-        if req_pool_indices.dtype != torch.int64:
-            raise ValueError(
-                "Triton sampling requires int32/int64 req_pool_indices, "
-                f"got {req_pool_indices.dtype}"
-            )
-        out = self._req_pool_indices_i32[:rows]
-        out.copy_(req_pool_indices, non_blocking=True)
-        return out
-
     def _write_logprob_outputs(
         self,
         logits_output: LogitsProcessorOutput,
@@ -277,6 +254,13 @@ class TritonSamplingBackend(SamplingBackend):
         if not self.config.enable_output_logprobs:
             return
 
+        if self.config.logprob_order != "torch":
+            # Megatron's order is a torch-level reduction tree; the fused
+            # Triton gather below is torch.log_softmax's order.
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                logits, sampled, logprob_order=self.config.logprob_order
+            )
+            return
         rows = logits.shape[0]
         selected_out = self._selected_logprob_out[:rows]
         logits_output.next_token_logprobs = selected_token_logprobs(
@@ -426,11 +410,7 @@ class TritonSamplingBackend(SamplingBackend):
         # so the pool route below serves them too — same path the CUDA graph
         # captures. Equivalence to argmax is pinned by
         # test_greedy_route_equivalence.py.
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         bs = logits.shape[0]
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
@@ -685,11 +665,7 @@ class TritonSamplingBackend(SamplingBackend):
             )
 
         # Greedy verifies through the same pool route (top_k=1); see sample().
-        offsets_pool = (
-            sampling_info.valid_cache_lengths
-            if sampling_info.valid_cache_lengths is not None
-            else self._zero_offsets_pool
-        )
+        offsets_pool = self._offsets_pool_for_kernels(sampling_info)
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
         )
