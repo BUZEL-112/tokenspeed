@@ -160,23 +160,22 @@ def test_push_run_lookup_requires_exact_source_and_actor(
     assert controller.find_run("release-pypi.yml", sha, "main", "push") == 2
 
 
-def test_version_pr_requires_registered_lint_and_pending_checks(release_module):
-    pr = {"statusCheckRollup": [], "reviewDecision": "", "mergeStateStatus": "CLEAN"}
-    assert not release_module.checks_ready(
-        pr, required_checks=set(), bypass_reviews=False
-    )
+def test_version_pr_does_not_wait_for_repeated_ci(release_module):
+    pr = {
+        "isDraft": False,
+        "reviewDecision": "REVIEW_REQUIRED",
+        "mergeable": "MERGEABLE",
+    }
+    assert release_module.version_pr_ready(pr)
     pr["statusCheckRollup"] = [
         {"name": "lint", "conclusion": "SUCCESS"},
         {"name": "build", "status": "IN_PROGRESS"},
     ]
-    assert not release_module.checks_ready(
-        pr, required_checks=set(), bypass_reviews=False
-    )
+    assert release_module.version_pr_ready(pr)
     pr["statusCheckRollup"][1]["conclusion"] = "FAILURE"
-    with pytest.raises(RuntimeError, match="PR check failed"):
-        release_module.checks_ready(pr, required_checks=set(), bypass_reviews=False)
-    pr["statusCheckRollup"][1]["conclusion"] = "SKIPPED"
-    assert release_module.checks_ready(pr, required_checks=set(), bypass_reviews=False)
+    assert release_module.version_pr_ready(pr)
+    pr["mergeable"] = "UNKNOWN"
+    assert not release_module.version_pr_ready(pr)
 
 
 def test_metadata_updates_both_versions_and_keeps_kernel_boundary(
@@ -332,6 +331,11 @@ def test_weekly_schedule_and_failure_resume_contract():
         {"cron": "0 20 * * 0", "timezone": "America/Los_Angeles"}
     ]
     assert workflow["concurrency"]["cancel-in-progress"] is False
+    assert workflow["jobs"]["plan"]["if"] == "needs.prepare.outputs.mode == 'normal'"
+    assert (
+        workflow["jobs"]["resume"]["if"] == "needs.prepare.outputs.mode == 'recovery'"
+    )
+    assert workflow["jobs"]["resume"]["with"]["stage"] == "release"
     for previous, stage in zip(
         ("plan", "amd", "kernel", "tokenspeed", "index", "docker"),
         ("amd", "kernel", "tokenspeed", "index", "docker", "release"),
@@ -343,6 +347,285 @@ def test_weekly_schedule_and_failure_resume_contract():
     upload = reusable["jobs"]["stage"]["steps"][-1]
     assert upload["if"] == "always()" and upload["with"]["overwrite"] is True
     assert reusable["jobs"]["stage"]["steps"][0]["with"]["persist-credentials"] is False
+
+
+@pytest.fixture
+def publication_state(release_module):
+    versions = {
+        package: "0.1.4" for package in (*release_module.PROJECTS, "tokenspeed-kernel")
+    }
+    stages = {stage: {"complete": True} for stage in release_module.STAGES[:-1]}
+    for stage, letter in zip(release_module.PACKAGES, "abc"):
+        stages[stage]["sha"] = letter * 40
+    stages["docker"]["image"] = "lightseekorg/tokenspeed:0.1.4"
+    runs = {}
+    for i, (workflow, stage, event) in enumerate(
+        (
+            ("release-tokenspeed-kernel-amd.yml", "amd", "workflow_dispatch"),
+            ("release-tokenspeed-kernel.yml", "kernel", "workflow_dispatch"),
+            ("release-tokenspeed-kernel-rocm.yml", "kernel", "workflow_dispatch"),
+            ("release-pypi.yml", "tokenspeed", "push"),
+            ("publish-release-docker.yml", "tokenspeed", "workflow_dispatch"),
+        ),
+        1,
+    ):
+        runs[workflow] = {
+            "id": i,
+            "sha": stages[stage]["sha"],
+            "ref": (
+                "main"
+                if event == "push"
+                else release_module.Release.branch(stage, "0.1.4")
+            ),
+            "event": event,
+            "complete": True,
+        }
+    return {"run_id": "123", "versions": versions, "stages": stages, "runs": runs}
+
+
+def test_oversized_generated_notes_publish_bounded_body_with_all_links(
+    release_module, publication_state, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(publication_state))
+    release = release_module.Release(path, "release")
+    generated = (
+        "- Change 中文: https://github.com/lightseekorg/tokenspeed/pull/1\n" * 3000
+    )
+    body = []
+    monkeypatch.setattr(release, "release_exists", lambda *args: False)
+
+    def api(path, *, data=None):
+        if data is None:
+            return [{"tag_name": "v0.1.3", "draft": False, "prerelease": False}]
+        assert (
+            path == "releases/generate-notes" and data["previous_tag_name"] == "v0.1.3"
+        )
+        assert data["target_commitish"] == "c" * 40
+        return {"body": generated}
+
+    def command(*args, **kwargs):
+        if args[:2] == ("git", "ls-remote"):
+            return "c" * 40 + "\t" + args[-1]
+        assert args[:3] == ("gh", "release", "create")
+        text = Path(args[args.index("--notes-file") + 1]).read_text()
+        # Model the actual API limit, including gh's server-generated notes path.
+        submitted = text + (generated if "--generate-notes" in args else "")
+        assert len(submitted) <= 125000
+        body.append(submitted)
+        return ""
+
+    monkeypatch.setattr(release_module, "api", api)
+    monkeypatch.setattr(release_module, "command", command)
+    monkeypatch.setattr(
+        release_module,
+        "request",
+        lambda *a, **kw: {"body": body[-1], "draft": False, "prerelease": False},
+    )
+    release.release()
+    assert len(body[0].encode()) <= 100000
+    assert "Biweekly component versions" in body[0]
+    for package, version in publication_state["versions"].items():
+        assert f"https://pypi.org/project/{package}/{version}/" in body[0]
+    assert "tokenspeed-kernel-v0.1.4-rocm72" in body[0]
+    assert "https://lightseek.org/whl/cu130/" in body[0]
+    assert "actions/runs/5" in body[0]
+    assert body[0].endswith(
+        "**Full Changelog**: https://github.com/lightseekorg/tokenspeed/compare/v0.1.3...v0.1.4\n"
+    )
+
+
+def test_release_only_recovery_validates_origin_and_never_republishes(
+    release_module, publication_state, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(publication_state))
+    with pytest.raises(RuntimeError, match="different weekly run"):
+        release_module.Release(path, "release")
+    with pytest.raises(RuntimeError, match="release stage"):
+        release_module.Release(path, "amd", resume_run_id="123")
+    with pytest.raises(RuntimeError, match="different weekly run"):
+        release_module.Release(path, "release", resume_run_id="456")
+    release = release_module.Release(path, "release", resume_run_id="123")
+    source = {
+        "status": "completed",
+        "path": ".github/workflows/weekly-release.yml",
+        "head_branch": "main",
+        "head_repository": {"full_name": release_module.REPO},
+        "event": "workflow_dispatch",
+    }
+    jobs = [
+        {"name": f"{stage} / stage", "conclusion": "success"}
+        for stage in release_module.STAGES[:-1]
+    ]
+
+    def api(path, *, data=None):
+        assert data is None
+        if path == "actions/runs/123":
+            return source
+        record = next(
+            r
+            for r in release.state["runs"].values()
+            if path == f"actions/runs/{r['id']}"
+        )
+        workflow = next(w for w, r in release.state["runs"].items() if r is record)
+        return {
+            "status": "completed",
+            "conclusion": "success",
+            "head_sha": record["sha"],
+            "head_branch": record["ref"],
+            "event": record["event"],
+            "actor": {"login": "lightseek-bot"},
+            "path": f".github/workflows/{workflow}",
+            "head_repository": {"full_name": release_module.REPO},
+            "html_url": f"https://github.com/{release_module.REPO}/actions/runs/{record['id']}",
+        }
+
+    manifest = {
+        "manifests": [
+            {"platform": {"os": "linux", "architecture": a}} for a in ("amd64", "arm64")
+        ]
+    }
+
+    def command(*args, **kwargs):
+        if args[:2] == ("docker", "buildx"):
+            return json.dumps(manifest)
+        assert args[:2] == ("gh", "api") and "--paginate" in args
+        return json.dumps([{"jobs": jobs}])
+
+    monkeypatch.setattr(release_module, "api", api)
+    monkeypatch.setattr(release_module, "command", command)
+    monkeypatch.setattr(
+        release_module, "source_sha", lambda p, v, w: release.state["runs"][w]["sha"]
+    )
+    monkeypatch.setattr(release, "wheelhouse", lambda *a: {})
+    monkeypatch.setattr(release, "guard", lambda: None)
+    monkeypatch.setattr(
+        release, "release", lambda: setattr(release, "page_verified", True)
+    )
+    monkeypatch.setattr(release, "cleanup", lambda: None)
+    release.run("")
+    assert release.publications_verified and release.phase["complete"]
+    assert release.state["versions"] == publication_state["versions"]
+    assert release.state["resumed_by_run_id"] == "999"
+    source["status"] = "in_progress"
+    with pytest.raises(RuntimeError, match="completed release run"):
+        release.validate_recovery()
+    source["status"] = "completed"
+    jobs[-1]["conclusion"] = "failure"
+    with pytest.raises(RuntimeError, match="all publication stages"):
+        release.validate_recovery()
+    jobs[-1]["conclusion"] = "success"
+    release.state["runs"]["release-pypi.yml"]["sha"] = "d" * 40
+    with pytest.raises(RuntimeError, match="source mismatch"):
+        release.verify_publications()
+
+
+def test_cleanup_deletes_only_expected_refs_and_refuses_moved_branches(
+    release_module, publication_state, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_RUN_ID", "123")
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(publication_state))
+    release = release_module.Release(path, "release")
+    refs = {
+        f"refs/heads/{release.branch(s, '0.1.4')}": publication_state["stages"][s][
+            "sha"
+        ]
+        for s in release_module.PACKAGES
+    }
+    deleted = []
+
+    def command(*args, **kwargs):
+        if args[:2] == ("git", "ls-remote"):
+            return f"{refs[args[-1]]}\t{args[-1]}" if args[-1] in refs else ""
+        ref = args[-1][1:]
+        assert (
+            args[:2] == ("git", "push")
+            and args[2] == f"--force-with-lease={ref}:{refs[ref]}"
+        )
+        deleted.append(ref)
+        del refs[ref]
+        return ""
+
+    monkeypatch.setattr(release_module, "command", command)
+    with pytest.raises(RuntimeError, match="verified publications"):
+        release.cleanup()
+    release.publications_verified = release.page_verified = True
+    moved = "refs/heads/release/kernel-0.1.4"
+    refs[moved] = "d" * 40
+    with pytest.raises(RuntimeError, match="branch that moved"):
+        release.cleanup()
+    assert not deleted
+    refs[moved] = "b" * 40
+    release.cleanup()
+    release.cleanup()
+    assert len(deleted) == 3 and not refs and release.phase["branches_cleaned"]
+
+
+def workflow_python(job):
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/weekly-release.yml").read_text()
+    )
+    script = workflow["jobs"][job]["steps"][0]["run"]
+    return script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+
+def test_biweekly_calendar_and_off_week_result(tmp_path, monkeypatch):
+    import datetime as dt
+
+    class Clock(dt.datetime):
+        current = dt.datetime(2026, 10, 18, 20)
+
+        @classmethod
+        def now(cls, tz):
+            return cls.current.replace(tzinfo=tz)
+
+    monkeypatch.setattr(dt, "datetime", Clock)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "lightseekorg/tokenspeed")
+    monkeypatch.setenv("GITHUB_REF", "refs/heads/main")
+    monkeypatch.setenv("RESUME_RUN_ID", "")
+    monkeypatch.setenv("VERSION", "")
+    monkeypatch.setenv("EVENT", "schedule")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(tmp_path / "output"))
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary"))
+    script = workflow_python("prepare")
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=normal\n")
+    Clock.current = dt.datetime(2026, 10, 25, 20)
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=skip\n")
+    # The next release falls after the fall-back transition, still at local 20:00.
+    Clock.current = dt.datetime(2026, 11, 1, 20)
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=normal\n")
+    monkeypatch.setenv("EVENT", "workflow_dispatch")
+    monkeypatch.setenv("RESUME_RUN_ID", "123")
+    exec(compile(script, "release-mode", "exec"), {})
+    assert (tmp_path / "output").read_text().endswith("mode=recovery\n")
+    results = {
+        stage: {"result": "skipped"}
+        for stage in (
+            "plan",
+            "amd",
+            "kernel",
+            "tokenspeed",
+            "index",
+            "docker",
+            "release",
+            "resume",
+        )
+    }
+    results["prepare"] = {"result": "success"}
+    monkeypatch.setenv("MODE", "skip")
+    monkeypatch.setenv("RESULTS", json.dumps(results))
+    exec(compile(workflow_python("result"), "release-result", "exec"), {})
+    monkeypatch.setenv("MODE", "recovery")
+    results["resume"]["result"] = "success"
+    monkeypatch.setenv("RESULTS", json.dumps(results))
+    exec(compile(workflow_python("result"), "release-result", "exec"), {})
 
 
 def test_source_tree_check_catches_unreleased_changes(
@@ -484,27 +767,18 @@ def test_stable_index_retries_after_concurrent_nightly_push(
     )
 
 
-def test_existing_bot_review_exemption_still_requires_required_ci(release_module):
+def test_version_pr_refuses_requested_changes_and_conflicts(release_module):
     pr = {
-        "statusCheckRollup": [{"name": "lint", "conclusion": "SUCCESS"}],
-        "reviewDecision": "REVIEW_REQUIRED",
-        "mergeStateStatus": "BLOCKED",
+        "isDraft": False,
+        "reviewDecision": "CHANGES_REQUESTED",
         "mergeable": "MERGEABLE",
     }
-    assert not release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=True
-    )
-    pr["statusCheckRollup"].append({"name": "finish", "conclusion": "SUCCESS"})
-    assert not release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=False
-    )
-    assert release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=True
-    )
-    pr["reviewDecision"] = "CHANGES_REQUESTED"
-    assert not release_module.checks_ready(
-        pr, required_checks={"finish"}, bypass_reviews=True
-    )
+    with pytest.raises(RuntimeError, match="manual review"):
+        release_module.version_pr_ready(pr)
+    pr["reviewDecision"] = ""
+    pr["mergeable"] = "CONFLICTING"
+    with pytest.raises(RuntimeError, match="merge conflicts"):
+        release_module.version_pr_ready(pr)
 
 
 def test_merge_policy_requires_explicit_existing_bot_exemption(
@@ -520,6 +794,9 @@ def test_merge_policy_requires_explicit_existing_bot_exemption(
                 {
                     "type": "required_status_checks",
                     "parameters": {"required_status_checks": [{"context": "finish"}]},
+                    "ruleset_source": release_module.REPO,
+                    "ruleset_source_type": "Repository",
+                    "ruleset_id": 2,
                 },
                 {
                     "type": "pull_request",
@@ -528,9 +805,202 @@ def test_merge_policy_requires_explicit_existing_bot_exemption(
                     "ruleset_id": 1,
                 },
             ]
-        return {"bypass_actors": actors}
+        return {"bypass_actors": actors if path == "rulesets/1" else ci_actors}
 
+    ci_actors = list(actors)
     monkeypatch.setattr(release_module, "api", api)
-    assert release_module.merge_policy() == ({"finish"}, True)
+    assert release_module.merge_policy()
+    ci_actors = []
+    assert not release_module.merge_policy()
+    ci_actors = list(actors)
     actors[0]["bypass_mode"] = "pull_request"
-    assert release_module.merge_policy() == ({"finish"}, False)
+    assert not release_module.merge_policy()
+
+
+@pytest.fixture
+def version_repository(release_module, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in set(sum(release_module.PR_FILES.values(), [])):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / name, path)
+    monkeypatch.chdir(source)
+    command = release_module.command
+    command("git", "init", "-b", "main")
+    command("git", "config", "user.name", "lightseek-bot")
+    command("git", "config", "user.email", release_module.IDENTITY)
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "initial metadata")
+    return source
+
+
+def test_main_ci_inherits_only_unchanged_inputs_and_retries_once(
+    controller, release_module, version_repository, monkeypatch, tmp_path
+):
+    command = release_module.command
+    workflows = version_repository / ".github/workflows"
+    workflows.mkdir(parents=True)
+    names = ("lint.yml", "kernel.yml", "old.yml", "release-pypi.yml")
+    for name in names:
+        push = {"branches": ["main"]}
+        if name == "kernel.yml":
+            push["paths"] = [
+                "tokenspeed-kernel/test/**",
+                "!tokenspeed-kernel/test/amd/**",
+            ]
+        (workflows / name).write_text(yaml.safe_dump({"on": {"push": push}}))
+    kernel = version_repository / "tokenspeed-kernel/test/test_kernel.py"
+    kernel.parent.mkdir(parents=True)
+    kernel.write_text("# kernel test input\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "CI inputs")
+    tested = command("git", "rev-parse", "HEAD")
+    ignored = kernel.parent / "amd/test_amd.py"
+    ignored.parent.mkdir()
+    ignored.write_text("# excluded input\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "AMD input")
+    (version_repository / "README.md").write_text("Documentation\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "docs")
+    head = command("git", "rev-parse", "HEAD")
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    catalog = [
+        {
+            "id": i + 1,
+            "path": f".github/workflows/{name}",
+            "state": "disabled_manually" if name == "old.yml" else "active",
+        }
+        for i, name in enumerate(names)
+    ]
+    runs = {}
+    reruns = []
+
+    def pages(path, key):
+        if key == "workflows":
+            return catalog
+        workflow_id = int(path.split("/")[2])
+        sha = head if workflow_id == 1 else tested
+        run = {
+            "id": workflow_id,
+            "head_sha": sha,
+            "head_branch": "main",
+            "event": "push",
+            "path": catalog[workflow_id - 1]["path"]
+            + ("@refs/heads/main" if workflow_id == 1 else ""),
+            "status": "completed",
+            "conclusion": "success" if workflow_id == 1 else "failure",
+            "run_attempt": 1,
+        }
+        runs[workflow_id] = run
+        return [run]
+
+    def retry_command(*args, **kwargs):
+        if args[:3] == ("gh", "run", "rerun"):
+            run_id = int(args[3])
+            saved = json.loads(controller.path.read_text())["main_ci"]["workflows"]
+            assert saved[runs[run_id]["path"]]["retry"]["requested"] is False
+            assert args[-3:] == ("--repo", release_module.REPO, "--failed")
+            reruns.append(run_id)
+            return ""
+        return command(*args, **kwargs)
+
+    def finish_retry():
+        runs[2].update(run_attempt=2, conclusion="success")
+
+    monkeypatch.setattr(release_module, "pages", pages)
+    monkeypatch.setattr(
+        release_module, "api", lambda path: runs[int(path.split("/")[-1])]
+    )
+    monkeypatch.setattr(release_module, "command", retry_command)
+    monkeypatch.setattr(controller, "pause", finish_retry)
+    controller.check_main_ci()
+    ci = controller.state["main_ci"]
+    assert ci["validated"] and ci["sha"] == head
+    assert set(ci["workflows"]) == {catalog[0]["path"], catalog[1]["path"]}
+    assert ci["workflows"][catalog[1]["path"]]["sha"] == tested
+    assert reruns == [2]
+    runs[2]["conclusion"] = "failure"
+    resumed = release_module.Release(controller.path, "amd")
+    with pytest.raises(RuntimeError, match="Main CI failed after retry"):
+        resumed.check_main_ci()
+    assert reruns == [2]
+
+
+def test_version_diff_rejects_non_version_changes_in_metadata_file(
+    controller, release_module, version_repository
+):
+    command = release_module.command
+    base = command("git", "rev-parse", "HEAD")
+    versions = {
+        p: release_module.next_version(
+            release_module.read_version(p), release_module.read_version(p), ""
+        )
+        for p in release_module.PACKAGES.values()
+    }
+    controller.state["versions"] = versions
+    release_module.update_metadata("amd", versions)
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "version metadata")
+    head = command("git", "rev-parse", "HEAD")
+    controller.verify_version_diff("amd", base, head)
+    command("git", "checkout", "--detach", head)
+    metadata = Path(release_module.PR_FILES["amd"][0])
+    metadata.write_text(metadata.read_text() + "\n# extra non-version change\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "--amend", "--no-edit")
+    with pytest.raises(RuntimeError, match="outside the expected metadata"):
+        controller.verify_version_diff("amd", base, command("git", "rev-parse", "HEAD"))
+
+
+def test_version_fast_forward_refuses_main_race(
+    controller, release_module, version_repository, tmp_path, monkeypatch
+):
+    command = release_module.command
+    base = command("git", "rev-parse", "HEAD")
+    versions = {
+        p: release_module.next_version(
+            release_module.read_version(p), release_module.read_version(p), ""
+        )
+        for p in release_module.PACKAGES.values()
+    }
+    controller.state.update(versions=versions, main_ci={"sha": base, "validated": True})
+    bare = tmp_path / "origin.git"
+    command("git", "clone", "--bare", str(version_repository), str(bare))
+    command("git", "remote", "add", "origin", str(bare))
+    release_module.update_metadata("amd", versions)
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "version metadata")
+    head = command("git", "rev-parse", "HEAD")
+    command("git", "push", "origin", f"{head}:refs/heads/bot/version")
+    command("git", "checkout", "--detach", base)
+    Path("README.md").write_text("Concurrent source change\n")
+    command("git", "add", ".")
+    command("git", "commit", "-s", "-m", "source update")
+    other = command("git", "rev-parse", "HEAD")
+    controller.phase.update(base=base, head=head, pr=1)
+    pr = {
+        "state": "OPEN",
+        "headRefOid": head,
+        "baseRefOid": base,
+        "isDraft": False,
+        "reviewDecision": "REVIEW_REQUIRED",
+        "mergeable": "MERGEABLE",
+    }
+
+    def racing_command(*args, **kwargs):
+        if args[:3] == ("gh", "pr", "view"):
+            return json.dumps(pr)
+        if args[:2] == ("git", "push"):
+            assert f"--force-with-lease=refs/heads/main:{base}" in args
+            command("git", "push", "origin", f"{other}:refs/heads/main")
+        return command(*args, **kwargs)
+
+    monkeypatch.setattr(release_module, "command", racing_command)
+    monkeypatch.setattr(release_module, "merge_policy", lambda: True)
+    with pytest.raises(release_module.subprocess.CalledProcessError):
+        controller.fast_forward_version("amd", pr)
+    assert command("git", "ls-remote", "origin", "refs/heads/main").split()[0] == other
