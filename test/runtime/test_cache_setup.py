@@ -340,17 +340,27 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
 
 
 @pytest.mark.parametrize(
-    ("replay_enabled", "replay_supported", "topk", "expected_workspace_bytes"),
+    (
+        "replay_enabled",
+        "replay_supported",
+        "topk",
+        "draft_tokens",
+        "expected_workspace_bytes",
+    ),
     # Non-replay stages conv+ssm for 8 verify rows: 8 * (8 + 8). Replay: 64
     # conv staging bytes plus the captured payload (6 rows of 7 bf16
     # channels) and the fp32 A_log/dt_bias pairs -- 64 + 84 + 16.
     # A replayed draft tree (topk 2) adds one 8-byte ssm state per draft position: 2 * 3 * 8.
     (
-        (False, True, 1, 128),
-        (True, False, 1, 128),
-        (True, True, 1, 164),
-        (False, True, 2, 128),
-        (True, True, 2, 212),
+        (False, True, 1, 3, 128),
+        (True, False, 1, 3, 128),
+        (True, True, 1, 3, 164),
+        (False, True, 2, 3, 128),
+        (True, True, 2, 3, 212),
+        (True, True, 2, 7, 452),
+        (True, True, 2, 8, 384),
+        (True, True, 2, 16, 736),
+        (True, True, 2, 17, 1052),
     ),
 )
 def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
@@ -358,6 +368,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     replay_enabled: bool,
     replay_supported: bool,
     topk: int,
+    draft_tokens: int,
     expected_workspace_bytes: int,
 ) -> None:
     monkeypatch.setattr(
@@ -386,7 +397,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     server_args = SimpleNamespace(
         block_size=64,
         max_total_tokens=None,
-        speculative_num_draft_tokens=3,
+        speculative_num_draft_tokens=draft_tokens,
         speculative_eagle_topk=topk,
         enable_replay_ssm=replay_enabled,
     )
