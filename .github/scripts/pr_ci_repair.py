@@ -447,14 +447,14 @@ Do not perform unrelated cleanup. Stop if the cause is uncertain.
     guard_root.joinpath("config.toml").write_bytes(
         Path(os.environ["KIMI_CODE_HOME"], "config.toml").read_bytes()
     )
-    print("Repair: preparing edit sandbox.", flush=True)
-    sandbox = edit_sandbox(
-        source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
-    )
-    print("Repair: starting repair process.", flush=True)
     with (plan_root / "events.jsonl").open("w") as events, (
         plan_root / "cli.stderr"
     ).open("w") as errors:
+        print("Repair: preparing edit sandbox.", flush=True)
+        sandbox = edit_sandbox(
+            source, allowed, [plan_root, Path(os.environ["KIMI_CODE_HOME"])]
+        )
+        print("Repair: starting repair process.", flush=True)
         result = subprocess.run(
             [
                 *sandbox,
