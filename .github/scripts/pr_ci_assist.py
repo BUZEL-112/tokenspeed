@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -279,9 +280,10 @@ def publish(state: dict, message: str):
         raise ValueError("Published state differs from reviewed content.")
 
 
-def checkout(head: str, base: str) -> Path:
-    WORK.mkdir(parents=True, exist_ok=True)
-    target = WORK / "source"
+def checkout(head: str, base: str, *, work: Path | None = None) -> Path:
+    work = WORK if work is None else work
+    work.mkdir(parents=True, exist_ok=True)
+    target = work / "source"
     for sha in (head, base):
         if not SHA.fullmatch(sha):
             raise ValueError("Invalid source SHA.")
@@ -876,13 +878,89 @@ def refresh_plan(state: dict, message: str):
     )
 
 
-def control(number: int):
+def repair_deadline(state: dict) -> int:
+    started = api(f"actions/runs/{state['repair_run']}")["run_started_at"]
+    return (
+        int(datetime.datetime.fromisoformat(started.replace("Z", "+00:00")).timestamp())
+        + 3600
+    )
+
+
+def control(number: int, *, expected_command: int | None = None):
     public_gate()
     pr = pull(number)
     comments = pages(f"issues/{number}/comments", None)
     state = load_state(comments, pr)
     comment = latest_command(comments)
+    resume_run = os.environ.get("REPAIR_RUN", "")
+    check_only = os.environ.get("REPAIR_CHECK_ONLY") == "true"
+    if check_only and not resume_run:
+        raise ValueError("Rechecking requires an authorized previous repair.")
+    if resume_run and (
+        os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"
+        or not resume_run.isdecimal()
+        or not state
+        or not comment
+        or state.get("repair_run") != int(resume_run)
+        or state["command"] != comment["id"]
+        or state["action"] != "fix"
+        or state["phase"] not in {"manual", "stale", "repairing"}
+        or (check_only and "candidate" in state)
+        or (state["head"], state["base"]) != (pr["head"]["sha"], pr["base"]["sha"])
+        or api(f"actions/runs/{resume_run}")["status"] != "completed"
+    ):
+        raise ValueError("Previous repair is not an authorized retry source.")
+    if expected_command is not None and (
+        not state
+        or not comment
+        or state["command"] != expected_command
+        or comment["id"] != expected_command
+    ):
+        return
+    if resume_run and "candidate" in state:
+        # A queued native check may finish after the previous hour ends.
+        # Refresh its source-bound result before choosing the next failure input.
+        runs = runs_for(state)
+        state["native_checks"] = [
+            (
+                native_check(
+                    {"workflow": c["workflow"], **NATIVE_CHECKS[c["workflow"]]},
+                    state,
+                    runs,
+                )
+                if c["status"] == "waiting"
+                else c
+            )
+            for c in state.get("native_checks", [])
+        ]
     initial = bool(comment and (not state or comment["id"] > state["command"]))
+    if (
+        not initial
+        and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and state
+        and comment
+        and comment["id"] == state["command"]
+        and state["action"] == "fix"
+        and state["phase"] in {"manual", "stale", "repairing"}
+        and ("candidate" not in state or resume_run)
+        and (state["head"], state["base"]) == (pr["head"]["sha"], pr["base"]["sha"])
+        and (
+            "repair_run" not in state
+            or api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+        )
+    ):
+        initial = True
+    diagnostics = (
+        {k: state[k] for k in ("native_checks", "run_ids") if k in state}
+        if resume_run
+        and state
+        and "candidate" in state
+        and (
+            "failed" in state["statuses"]
+            or any(c["status"] == "failed" for c in state.get("native_checks", []))
+        )
+        else None
+    )
     if initial:
         action = permitted(comment)
         prior = state
@@ -909,11 +987,44 @@ def control(number: int):
                 if t.startswith((f"Slurm {state['head']} |", f"K8s {state['head']} |"))
             ]
             state["since"] = prior["since"]
+    # Explicit reconciliation can recover a controller failure without
+    # replacing the checked candidate or extending its original deadline.
+    if (
+        not resume_run
+        and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+        and state
+        and comment
+        and state["phase"] == "manual"
+        and "candidate" in state
+        and state["command"] == comment["id"]
+        and state["action"] == "fix"
+        and permitted(comment) == "fix"
+        and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
+    ):
+        state["phase"] = "validating"
+        initial = True
     if not state or state["phase"] in FINISHED_PHASES:
         return
-    if state["head"] != pr["head"]["sha"] or state["base"] != pr["base"]["sha"]:
+    if (
+        state["head"] != pr["head"]["sha"]
+        or state["base"] != pr["base"]["sha"]
+        or (
+            "validation_base" in state
+            and state["validation_base"] != api("git/ref/heads/main")["object"]["sha"]
+        )
+    ):
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
+        return
+    if (
+        state["phase"] in {"repairing", "validating"}
+        and "repair_run" in state
+        and time.time() >= repair_deadline(state)
+    ):
+        state["phase"] = "manual"
+        publish(
+            state, "The one-hour repair and validation budget expired; PR unchanged."
+        )
         return
     if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
         event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
@@ -1019,23 +1130,37 @@ def control(number: int):
         return
     runs = runs_for(state)
     previous_checks = state.get("native_checks", [])
-    # Conflicts are repaired first; candidates need their own native results.
-    track_native = (
-        "candidate" in state
-        or state["action"] == "watch"
-        or pr["mergeable"] is not False
-    )
+    # Preserve failed-check evidence while resolving merge conflicts.
     state["native_checks"] = [
-        native_check(check, state, runs)
-        for check in data.get("native_checks", [])
-        if track_native
+        native_check(check, state, runs) for check in data.get("native_checks", [])
     ]
     native_statuses = [c["status"] for c in state["native_checks"]]
     if "candidate" in state:
         dispatch_native_checks(state)
-    if any(s in {"missing", "blocked"} for s in native_statuses) or (
-        "failed" in native_statuses
-        and (state["action"] != "fix" or "candidate" in state)
+    requested_fix = state["action"] == "fix" and "candidate" not in state
+    lint = next(
+        (
+            r
+            for r in runs
+            if r.get("path") == ".github/workflows/lint.yml"
+            and r.get("event") == "pull_request"
+            and r.get("head_sha") == state["head"]
+            and any(
+                p["number"] == number and p["head"]["sha"] == state["head"]
+                for p in r.get("pull_requests", [])
+            )
+        ),
+        None,
+    )
+    lint_run = (
+        lint["id"]
+        if lint and lint["status"] == "completed" and lint["conclusion"] == "failure"
+        else None
+    )
+    if (
+        "blocked" in native_statuses
+        or ("missing" in native_statuses and not (requested_fix and lint_run))
+        or ("failed" in native_statuses and not requested_fix)
     ):
         state["phase"] = "manual"
         publish(
@@ -1043,7 +1168,6 @@ def control(number: int):
             "Native checks need human intervention; no dispatch retry or PR update.",
         )
         return
-    requested_fix = state["action"] == "fix" and "candidate" not in state
     if requested_fix and pr["mergeable"] is False:
         state["conflicts"] = True
         statuses = ["waiting"] * len(tasks)
@@ -1052,10 +1176,15 @@ def control(number: int):
     previous = state["statuses"]
     state["statuses"] = statuses
     if requested_fix and (
-        pr["mergeable"] is False or "failed" in statuses or "failed" in native_statuses
+        resume_run
+        or lint_run
+        or pr["mergeable"] is False
+        or "failed" in statuses
+        or "failed" in native_statuses
     ):
         state["phase"] = "repairing"
         state["repair_run"] = int(os.environ["GITHUB_RUN_ID"])
+        state["validation_base"] = api("git/ref/heads/main")["object"]["sha"]
         publish(
             state,
             (
@@ -1071,6 +1200,11 @@ def control(number: int):
                     "plan": plan,
                     "data": data,
                     "conflicts": pr["mergeable"] is False,
+                    "deadline": repair_deadline(state),
+                    "resume_run": int(resume_run) if resume_run else None,
+                    "check_only": check_only,
+                    "lint_run": lint_run,
+                    **({"diagnostics": diagnostics} if diagnostics is not None else {}),
                 }
             )
         )
@@ -1114,11 +1248,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("stage", choices=("resolve", "control", "plan-source"))
     parser.add_argument("--pr", type=int)
+    parser.add_argument("--command", type=int)
     args = parser.parse_args()
     try:
         {
             "resolve": resolve,
-            "control": lambda: control(args.pr),
+            "control": lambda: control(args.pr, expected_command=args.command),
             "plan-source": plan_source,
         }[args.stage]()
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError):
