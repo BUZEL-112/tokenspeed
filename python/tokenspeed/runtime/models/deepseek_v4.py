@@ -27,6 +27,7 @@ until the HCA/CSA cache kernels are wired into TokenSpeed.
 
 from __future__ import annotations
 
+import functools
 import gc
 import re
 from collections.abc import Iterable
@@ -34,18 +35,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import (
-    dsv4_grouped_output_projection,
-    dsv4_grouped_output_projection_plan,
-    dsv4_grouped_output_projection_warmup_model,
-    dsv4_linear_fp32,
-)
-from tokenspeed_kernel import mhc_fused_hc as fast_mhc_fused_hc
-from tokenspeed_kernel import mhc_post as fast_mhc_post
-from tokenspeed_kernel import mhc_pre as fast_mhc_pre
-from tokenspeed_kernel import (
-    moe_topk,
-)
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode_topk, dsa_prefill_topk
 from tokenspeed_kernel.ops.attention.dsv4 import (
     dsv4_decode_topk,
@@ -60,6 +49,16 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_group_slot_mapping,
     dsv4_indexer_decode_metadata_compute,
 )
+from tokenspeed_kernel.ops.gemm import (
+    dsv4_grouped_output_projection,
+    dsv4_grouped_output_projection_plan,
+    dsv4_grouped_output_projection_warmup_model,
+    dsv4_linear_fp32,
+)
+from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.residual import mhc_fused_hc as fast_mhc_fused_hc
+from tokenspeed_kernel.ops.residual import mhc_post as fast_mhc_post
+from tokenspeed_kernel.ops.residual import mhc_pre as fast_mhc_pre
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -125,7 +124,12 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopK, TopKOutput
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutput,
+    simulated_router_logits,
+)
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
@@ -1558,6 +1562,16 @@ class DeepseekV4MLP(nn.Module):
         return out
 
 
+def _random_expert_ids(
+    param: torch.Tensor, generator: torch.Generator, num_experts: int
+) -> None:
+    """Give each token distinct experts, chosen uniformly at random."""
+    scores = torch.rand(
+        param.shape[0], num_experts, generator=generator, device=param.device
+    )
+    param.data.copy_(scores.topk(param.shape[1], dim=1).indices)
+
+
 class DeepseekV4MoEGate(nn.Module):
     def __init__(
         self,
@@ -1578,6 +1592,9 @@ class DeepseekV4MoEGate(nn.Module):
                     dtype=hash_indices_dtype,
                 ),
                 requires_grad=False,
+            )
+            self.tid2eid.dummy_initializer = functools.partial(
+                _random_expert_ids, num_experts=config.n_routed_experts
             )
             self.e_score_correction_bias = None
         elif getattr(config, "topk_method", None) == "noaux_tc":
@@ -1627,6 +1644,8 @@ class DeepseekV4TopK(TopK):
             if routing_correction_bias is None
             else routing_correction_bias
         )
+        if self.simulate_routing:
+            router_logits = simulated_router_logits(router_logits)
         topk_weights, topk_ids = moe_topk(
             router_logits,
             self.topk_config.top_k,
