@@ -268,6 +268,11 @@ def test_native_result_needs_current_source_and_executed_test(
     assert assist.native_check(check, state, [newer, run])["status"] == "failed"
     run["pull_requests"][0]["base"]["sha"] = "c" * 40
     assert assist.native_check(check, state, [run])["run"] == 0
+    state["action"] = "fix"
+    run["conclusion"] = "failure"
+    assert assist.native_check(check, state, [run])["status"] == "failed"
+    run["conclusion"] = "success"
+    assert assist.native_check(check, state, [run])["run"] == 0
     run["head_sha"] = "d" * 40
     assert assist.native_check(check, state, [run])["run"] == 0
 

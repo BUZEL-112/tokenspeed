@@ -413,9 +413,13 @@ def native_check(check: dict, state: dict, runs: list[dict]) -> dict:
                 run["event"] == "pull_request"
                 and run["head_sha"] == state["head"]
                 and any(
-                    p["number"] == state["pr"]
-                    and p["head"]["sha"] == state["head"]
-                    and p["base"]["sha"] == state["base"]
+                    p["number"] == state["pr"] and p["head"]["sha"] == state["head"]
+                    # An older base failure can diagnose this unchanged head;
+                    # only the candidate's own run can validate its repair.
+                    and (
+                        p["base"]["sha"] == state["base"]
+                        or (state["action"] == "fix" and run["conclusion"] == "failure")
+                    )
                     and p["base"]["ref"] == "main"
                     for p in run["pull_requests"]
                 )
