@@ -86,12 +86,21 @@ def pull(number: int) -> dict:
 
 def permitted(comment: dict) -> str | None:
     match = COMMAND.fullmatch(comment["body"] or "")
-    if not match:
+    if not match or (match["job"] and match[1].lower() != "fix"):
         return None
     permission = api(f"collaborators/{comment['user']['login']}/permission")[
         "permission"
     ]
     return match[1].lower() if permission in {"admin", "maintain", "write"} else None
+
+
+def command_target(comment: dict, number: int) -> dict | None:
+    match = COMMAND.fullmatch(comment["body"] or "")
+    if not match or not match["job"]:
+        return None
+    if match["pr"] and int(match["pr"]) != number:
+        raise ValueError("Job link names another PR.")
+    return {k: int(match[k]) for k in ("run", "job")}
 
 
 def latest_command(comments: list[dict]) -> dict | None:
@@ -353,7 +362,13 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
         if runner not in runners or (
             cluster == ""
             and (
-                not runner.startswith("amd-")
+                (
+                    not runner.startswith("amd-")
+                    and (
+                        selected != data.get("target_task")
+                        or not runner.startswith(("b200v2-", "gb200-", "b300-"))
+                    )
+                )
                 or not re.search(r"(?:^|-)[1-9][0-9]*gpu(?:-|$)", runner)
             )
         ):
@@ -378,6 +393,58 @@ def validate_plan(plan: dict, data: dict) -> list[dict]:
         raise ValueError("Invalid selected coverage.")
     validate_test_coverage(plan["tests"], tasks, data["catalog"], data.get("paths", []))
     return tasks
+
+
+def targeted_plan(plan: dict, data: dict, state: dict) -> dict:
+    """Bind the requested failed job to existing, source-bound validation."""
+    target = state.get("target")
+    if not target:
+        return plan
+    job = api(f"actions/jobs/{target['job']}")
+    run = api(f"actions/runs/{job['run_id']}")
+    if (
+        job["id"] != target["job"]
+        or job["run_id"] != target["run"]
+        or job["run_attempt"] != run["run_attempt"]
+        or job["status"] != "completed"
+        or job["conclusion"] not in {"failure", "timed_out"}
+        or run["event"] != "pull_request"
+        or run["head_repository"]["full_name"] != REPO
+        or run["head_sha"] != state["head"]
+        or job["head_sha"] != state["head"]
+        or not any(
+            p["number"] == state["pr"] and p["head"]["sha"] == state["head"]
+            for p in run["pull_requests"]
+        )
+    ):
+        raise ValueError("Target must be a failed job on the current PR commit.")
+    # Native jobs already have trusted verification entry points.
+    for workflow, check in NATIVE_CHECKS.items():
+        if (
+            run["path"] == f".github/workflows/{workflow}"
+            and job["name"] == check["job"]
+        ):
+            checks = data.setdefault("native_checks", [])
+            if not any(c["workflow"] == workflow for c in checks):
+                checks.append({"workflow": workflow, **check})
+            return plan
+    if run["path"] == ".github/workflows/lint.yml" and job["name"] == "lint":
+        return plan
+    choices = [
+        {"config": task["config"], "runner": runner, "cluster": ""}
+        for task in data["catalog"]
+        for runner in task["runners"]
+        if job["name"].endswith(f"{task['name']} ({runner})")
+    ]
+    if len(choices) != 1:
+        raise ValueError("Target job has no unique supported validation task.")
+    data["target_task"] = choices[0]
+    tasks = list(plan["tasks"])
+    if choices[0] not in tasks:
+        tasks.append(choices[0])
+    plan = {**plan, "tasks": tasks}
+    validate_plan(plan, data)
+    return plan
 
 
 def effective_runner(task: dict, cluster: str) -> str:
@@ -407,7 +474,9 @@ def dispatch(task: dict, sha: str, cluster: str):
     if cluster:
         fields.update(cluster=cluster, runners=task["runner"], require_idle="true")
     else:
-        fields.update(runner_pool="amd", runner=task["runner"])
+        fields.update(
+            runner_pool=task["runner"].split("-", 1)[0], runner=task["runner"]
+        )
     args = [
         "gh",
         "workflow",
@@ -899,6 +968,7 @@ def load_state(comments: list[dict], pr: dict) -> dict | None:
     if (
         command_comment["issue_url"].rsplit("/", 1)[-1] != str(pr["number"])
         or permitted(command_comment) != state["action"]
+        or command_target(command_comment, pr["number"]) != state.get("target")
     ):
         raise ValueError("Command is no longer authorized.")
     return state
@@ -1027,6 +1097,9 @@ def control(number: int, *, expected_command: int | None = None):
             since=comment["id"],
             submitted=[],
         )
+        target = command_target(comment, number)
+        if target:
+            state["target"] = target
         if prior and (prior["head"], prior["base"]) == (state["head"], state["base"]):
             state["submitted"] = [
                 t
@@ -1034,9 +1107,9 @@ def control(number: int, *, expected_command: int | None = None):
                 if t.startswith((f"Slurm {state['head']} |", f"K8s {state['head']} |"))
             ]
             state["since"] = prior["since"]
-    # Explicit reconciliation can recover a controller failure without
-    # replacing the checked candidate or extending its original deadline.
-    if (
+    # Explicit reconciliation can publish an already checked candidate after
+    # queueing consumed its repair budget; it never submits more validation.
+    reconcile = bool(
         not resume_run
         and os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
         and state
@@ -1047,7 +1120,18 @@ def control(number: int, *, expected_command: int | None = None):
         and state["action"] == "fix"
         and permitted(comment) == "fix"
         and api(f"actions/runs/{state['repair_run']}")["status"] == "completed"
-    ):
+    )
+    deadline = 0
+    if reconcile:
+        started = api(f"actions/runs/{os.environ['GITHUB_RUN_ID']}")["run_started_at"]
+        deadline = (
+            int(
+                datetime.datetime.fromisoformat(
+                    started.replace("Z", "+00:00")
+                ).timestamp()
+            )
+            + 15 * 60
+        )
         state["phase"] = "validating"
         initial = True
     if not state or state["phase"] in FINISHED_PHASES:
@@ -1063,14 +1147,21 @@ def control(number: int, *, expected_command: int | None = None):
         state["phase"] = "stale"
         publish(state, "PR or main changed. Request a new plan and command.")
         return
+    if not reconcile and "repair_run" in state:
+        deadline = repair_deadline(state)
     if (
         state["phase"] in {"repairing", "validating"}
         and "repair_run" in state
-        and time.time() >= repair_deadline(state)
+        and time.time() >= deadline
     ):
         state["phase"] = "manual"
         publish(
-            state, "The one-hour repair and validation budget expired; PR unchanged."
+            state,
+            (
+                "The reconciliation budget expired; PR unchanged."
+                if reconcile
+                else "The one-hour repair and validation budget expired; PR unchanged."
+            ),
         )
         return
     if "plan_refresh" in state and os.environ["GITHUB_EVENT_NAME"] == "workflow_run":
@@ -1124,6 +1215,7 @@ def control(number: int, *, expected_command: int | None = None):
             publish(state, "Waiting for the current CI plan to finish.")
         return
     try:
+        plan = targeted_plan(plan, data, state)
         tasks = validate_plan(plan, data)
     except CoverageError:
         if "plan_refresh" not in state:
@@ -1142,11 +1234,11 @@ def control(number: int, *, expected_command: int | None = None):
         state["phase"] = "manual"
         publish(
             state,
-            "Some planned tasks have no supported GPU route. Human intervention required.",
+            "The requested job or selected tasks cannot be validated for this PR. Human intervention required.",
         )
         return
     replanned = state.pop("plan_refresh", None) is not None
-    if not tasks and not data.get("native_checks"):
+    if not tasks and not data.get("native_checks") and not state.get("target"):
         state["phase"] = "manual"
         publish(
             state,
@@ -1182,7 +1274,7 @@ def control(number: int, *, expected_command: int | None = None):
         native_check(check, state, runs) for check in data.get("native_checks", [])
     ]
     native_statuses = [c["status"] for c in state["native_checks"]]
-    if "candidate" in state:
+    if "candidate" in state and not reconcile:
         dispatch_native_checks(state)
     requested_fix = state["action"] == "fix" and "candidate" not in state
     lint = next(
@@ -1206,7 +1298,10 @@ def control(number: int, *, expected_command: int | None = None):
     )
     if (
         "blocked" in native_statuses
-        or ("missing" in native_statuses and not (requested_fix and lint_run))
+        or (
+            "missing" in native_statuses
+            and not (requested_fix and (lint_run or state.get("target")))
+        )
         or ("failed" in native_statuses and not requested_fix)
     ):
         state["phase"] = "manual"
@@ -1215,15 +1310,16 @@ def control(number: int, *, expected_command: int | None = None):
             "Native checks need human intervention; no dispatch retry or PR update.",
         )
         return
-    if requested_fix and pr["mergeable"] is False:
-        state["conflicts"] = True
+    if requested_fix and (pr["mergeable"] is False or state.get("target")):
+        state["conflicts"] = pr["mergeable"] is False
         statuses = ["waiting"] * len(tasks)
     else:
-        statuses = [task_status(t, state, runs, submit=True) for t in tasks]
+        statuses = [task_status(t, state, runs, submit=not reconcile) for t in tasks]
     previous = state["statuses"]
     state["statuses"] = statuses
     if requested_fix and (
         resume_run
+        or state.get("target")
         or lint_run
         or pr["mergeable"] is False
         or "failed" in statuses
@@ -1258,10 +1354,14 @@ def control(number: int, *, expected_command: int | None = None):
         output("repair", "true")
         return
     combined = native_statuses + statuses
+    if reconcile and not all(s == "passed" for s in combined):
+        state["phase"] = "manual"
+        publish(state, "Validation has not fully passed; PR unchanged.")
+        return
     if "candidate" in state and all(s == "passed" for s in combined):
         from pr_ci_repair import promote
 
-        promote(state)
+        promote(state, deadline=deadline)
         state["phase"] = "promoted"
         publish(
             state,
