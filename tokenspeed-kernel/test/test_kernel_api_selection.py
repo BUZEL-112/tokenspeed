@@ -2824,6 +2824,53 @@ def test_mhc_pre_preserves_positional_kernel_selection(monkeypatch) -> None:
     assert selected["solution"] == "legacy_solution"
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expected"),
+    [
+        (64, "gluon_mhc_pre_gfx950"),
+        (65, "triton_mhc_pre"),
+        (256, "triton_mhc_pre"),
+        (257, "gluon_mhc_prefill_gfx950"),
+        (1025, "gluon_mhc_prefill_gfx950"),
+        (8193, "gluon_mhc_prefill_gfx950"),
+        (131072, "triton_mhc_pre"),
+    ],
+)
+def test_mhc_prefill_selects_gfx950_projection(
+    mi350_platform: PlatformInfo, num_tokens: int, expected: str
+) -> None:
+    registry = KernelRegistry.get()
+    if registry.get_by_name("gluon_mhc_prefill_gfx950") is None:
+        pytest.skip("optional AMD kernel package is unavailable")
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        selected = select_kernel(
+            "residual",
+            "mhc_pre",
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                fn=dense_tensor_format(torch.float32),
+                hc_scale=dense_tensor_format(torch.float32),
+                hc_base=dense_tensor_format(torch.float32),
+            ),
+            traits={
+                "num_tokens": num_tokens,
+                "buffer_offsets_fit_int32": num_tokens * 4 * 4096 < 2**31,
+                "hc_mult": 4,
+                "hidden_size": 4096,
+                "sinkhorn_iters": 20,
+            },
+        )
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert selected.name == expected
+
+
 def test_mhc_normalization_contract_is_explicit() -> None:
     parameters = inspect.signature(kernel_mhc_pre).parameters
 

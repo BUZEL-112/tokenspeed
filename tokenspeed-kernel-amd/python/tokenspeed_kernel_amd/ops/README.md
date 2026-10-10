@@ -772,3 +772,24 @@ probabilities by 256 before the E4M3 cast to preserve small weights, and
 divide out that factor at normalization. The projected-value API applies
 the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
+
+## Residual
+
+### gfx950 mHC pre-mapping
+
+The operation accepts BF16 residual streams shaped `[..., 4, hidden_size]`,
+FP32 projection weights shaped `[24, 4 * hidden_size]`, three FP32 scales,
+24 FP32 biases, normalization epsilons, and a Sinkhorn iteration count. It returns
+a BF16 layer input
+`[..., hidden_size]`, FP32 post coefficients `[..., 4, 1]`, and an FP32
+combination matrix `[..., 4, 4]`. Optional output RMS normalization takes a
+weight vector and its epsilon together.
+
+The four streams are flattened and projected with FP32 accumulation, while
+their squared values provide the residual RMS normalization factor. Projection
+partials are summed. Sigmoid transforms produce the pre/post
+coefficients; a stable softmax followed by alternating Sinkhorn row and column
+normalization produces the combination matrix. The pre coefficients mix the
+four residual streams into the layer input, rounded to BF16 before optional
+output RMS normalization. Staged projection weights are reused across token
+rows, and the final projection tile is masked for arbitrary token counts.
