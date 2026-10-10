@@ -22,6 +22,31 @@ For a compact compatibility table, see
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
 
+### Checkpoint Prefetch And TP Shards
+
+Safetensors loading prefetches checkpoints into the OS page cache. Ranks on
+the same node divide background reads in sorted shard order; every node
+prefetches its own copy. Each reader keeps the full consumption order within
+the existing window of min(40 GiB, 25% of available host memory), including
+shards assigned to peers. Reads remain asynchronous: a consumer does not
+wait for another rank and can demand-page an unfinished peer shard. Models
+with rank-dependent weight-name filters prefetch independently. Use
+`--disable-weight-loader-prefetch-checkpoints` to disable prefetch or
+`--weight-loader-prefetch-num-threads` to set reader concurrency per rank.
+
+The programmatic `LoadConfig(load_format="sharded_state")` loader reads only
+the current global rank's files,
+named `model-rank-{rank}-part-{part}.safetensors` by default. These are
+post-processed runtime state dictionaries, not ordinary Hugging Face shards.
+Reload with the same model configuration, parallel mapping, quantization,
+and runtime weight layout. The loader constructs and post-processes the
+model before copying the saved state into it; compatibility must be checked
+for the model and quantization in use. Keep model configuration/tokenizer
+files with the checkpoint. A custom filename pattern can be supplied through
+`LoadConfig.model_loader_extra_config`, for example
+`{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
+not expose this loader or its extra configuration.
+
 ## Precision And Quantization
 
 | Parameter | Purpose |
