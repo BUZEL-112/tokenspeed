@@ -406,7 +406,6 @@ def test_main_ci_completion_skips_before_resolving_pr(monkeypatch, tmp_path):
     workflow = yaml.safe_load(
         (assist.ROOT / ".github/workflows/pr-ci-assist.yml").read_text()
     )
-    assert "NVIDIA Kernel Library Tests" in workflow[True]["workflow_run"]["workflows"]
     assert workflow[True]["workflow_run"]["branches-ignore"] == ["main"]
     assert "workflow_call" in workflow[True]
     dispatcher = yaml.safe_load(
@@ -2601,12 +2600,5 @@ def test_assist_workflow_wakes_only_for_owned_dispatches_and_sweeps():
     )
     triggers = workflow.get("on", workflow.get(True))
     workflows = set(triggers["workflow_run"]["workflows"])
-    assert "Slurm Dispatch" in workflows and "K8s Dispatch" in workflows
-    assert not {
-        "NVIDIA B200 Tests",
-        "NVIDIA GB200 Tests",
-        "NVIDIA GB300 Tests",
-        "PR Test NVIDIA ARM",
-        "AMD Tests",
-    }.intersection(workflows)
+    assert workflows == {"PR CI Plan", "Slurm Dispatch", "K8s Dispatch"}
     assert triggers["schedule"] == [{"cron": "13,33,53 * * * *"}]
