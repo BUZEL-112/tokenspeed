@@ -11,14 +11,15 @@ prefix granularity, cache groups, LCM blocks).
 
 ## 1. Admission is per chunk
 
-A prompt is prefilled in chunks bounded by `max_scheduled_tokens`
-(`--chunked-prefill-size`). Capacity is admitted **for the chunk being
+The scheduler schedules a prompt's prefill in chunks bounded by
+`max_scheduled_tokens` (`--chunked-prefill-size`). It admits capacity **for
+the chunk being
 scheduled, never for the whole prompt**: `schedulePrefill` /
 `schedulePrefillFirstChunk` build one `GroupDemand` per cache group sized by
 this chunk's tokens, and the coordinator either grants the pages or the
 request stays put. Alongside the demands, one `RequestProgress` per request
 carries what it computed since its previous admission — the prefix pages
-just completed and its computed-token count — which the coordinator publishes
+completed and its computed-token count — which the coordinator publishes
 and reclaims inside the same `Admit` (`advanceRequestProgress` in
 `scheduler/operations/forward.cpp` is the one place that hashes those pages
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
@@ -267,9 +268,9 @@ progress: `TokenContainer::Window{begin, size, replay}` keeps `begin`/`size`
 as the tokens this chunk computes (`replay` is non-zero only on a hit's first
 chunk), and `MakePrefillInfo` derives the model input
 `[begin − replay, begin + size)`. The runtime sees the pair
-`extend_prefix_len = begin − replay` and `extend_replay_len = replay` on the
-`ForwardBatch`; positions `[extend_prefix_len, extend_prefix_len +
-extend_replay_len)` regenerate the replayable groups only and must not be
+`extend_prefix_lens[i] = begin − replay` and `extend_replay_lens[i] = replay` on the
+`ForwardBatch`; positions `[extend_prefix_lens[i], extend_prefix_lens[i] +
+extend_replay_lens[i])` regenerate the replayable groups only and must not be
 written into any other group, whose rows already sit in the shared cached
 pages the hit claimed.
 
@@ -315,7 +316,7 @@ continuation state, decode reserve, overlap-depth protection, the state growth
 block, and for chunked sparse local recovery the retained input checkpoint
 (and, with the prefix cache on, a first chunk's cached one) — fits the pool.
 It is not a live check against currently free capacity; a prompt within the
-bound can still fail admission right now and simply waits.
+bound can still fail admission right now and waits.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -328,7 +329,7 @@ demand at `max_batch_size` live requests), and then lets the `Scheduler`
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens,
 `SnapshotStateReserveTokens`, a group's prefix-match lookback (the same
-`PrefixMatcher` the coordinator builds, via `MakePrefixMatcher`) — exists in
+`PrefixMatcher` the coordinator builds, through `MakePrefixMatcher`) — exists in
 that one file; neither side restates it. The two answers are tied by an
 invariant the model's tests sweep: for one live request of `L` tokens,
 `ConcurrentGroupPages(L, L)` is never below `SingleRequestGroupPages(L)` in
@@ -343,6 +344,12 @@ protected tokens that may spill past it; a sliding group, per request,
 `ceil((min(W - 1, ctx) + decode_width + protected + g - 1) / g)` resident
 pages, plus one in-flight prefill chunk behind its lookback (or, on the
 decode role, the landing bound `min(dense, lookback + window)` per request).
+
+Speculative decode admission grows from the committed token frontier plus the verify
+spans still in flight and the span being scheduled. Already reserved slots
+cover that extent first. A prefill interruption must not charge the same
+speculative slots again when decode resumes; otherwise rejected draft tokens
+accumulate in the logical tables beyond the context-length bound.
 
 For an internal checkpoint followed by `tail` tokens, the forward holds
 both the tail and the ordinary growth reserve: the output working set is
@@ -429,11 +436,11 @@ the way from one state to the next.
 
 The bundle follows one rule: **resources and publication progress land when
 an admission succeeds; a state transition only moves them, never modifies
-them.** The block tables are filled by the coordinator inside `Admit`; the
-cache progress (prefix-hash chain, promotion boundary, pending state
-checkpoints) is advanced by the scheduler on a copy, handed to that same
-admission — which publishes the newly completed pages — and written back to
-the request only after it succeeds. A failed admission therefore leaves both
+them.** The coordinator fills the block tables inside `Admit`; the scheduler
+advances the cache progress (prefix-hash chain, promotion boundary, pending
+state checkpoints) on a copy, hands it to that same admission — which
+publishes the newly completed pages — and writes it back to the request only
+after the admission succeeds. A failed admission therefore leaves both
 untouched, and the retry re-derives the same completed pages and asks for
 their publication again. Committing progress before admission would record
 the pages as hashed while never publishing them. Landed results advance token
@@ -454,7 +461,7 @@ request whose reserve already covers its whole generation
 (`Request::ReserveCoversGeneration`) — retracting it frees exactly what its
 readmission must take back, pure thrash.
 
-The P role never retracts: `buildPrefillWorkerPlan` simply does not call
+The P role never retracts: `buildPrefillWorkerPlan` does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
 grammars). See 3.1 for why.
 
@@ -602,14 +609,14 @@ stay aligned, and a D-role `plan.remote_prefill` admission retracts with
 them — the peer pull is withheld so suffix-only KV cannot land on empty
 prefix pages. The client is not failed. There is no queue to keep in
 step with the FSM: a request that finishes or aborts while retracted
-simply stops qualifying, with no bookkeeping to prune.
+stops qualifying, with no bookkeeping to prune.
 Nor is bounded replay (§1.3) carried across a
 retraction: the readmission re-probes and derives its replay window from the
 new hit, and the L2 snapshot never holds a replayable group's pages.
 
 **A readmission that does not fit, waits.** Its failed admission never
 triggers retraction (it is never recorded as the capacity blocker): when the
-readmission needs a victim, the two simply do not fit together, and swapping
+readmission needs a victim, the two do not fit together, and swapping
 them — a writeback, a load-back and a re-prefill per swap — is pure thrash.
 The resident request keeps running and its completion frees the space. This
 replaces the old `recovering_` head-of-line pin, and unlike escalation-bounded
